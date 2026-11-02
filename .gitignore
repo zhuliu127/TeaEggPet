@@ -1,0 +1,23 @@
+# 角色素材（约 120MB 精灵动画）不进仓库，从上游项目获取后放到这里：
+#   https://github.com/MerZlin/dsh-pet-indesktop
+# 直接用 Release 里的打包版则不需要关心这个。
+assets/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 打包产物
+dist/
+dist-*/
+build/
+build-*/
+*.spec
+
+# 本地数据 / 日志
+*.log
+.petdesk/
