@@ -43,8 +43,8 @@ def test_settings_update_page_does_not_write_config(tmp_path, monkeypatch):
     config = Config(tmp_path)
     before = config.path.read_bytes() if config.path.exists() else None
     page = UpdatePage(config, include_chat=False)
-    # 模拟版本必须比当前 __version__ 新（版本号会随发布上涨，写死必腐坏）
-    from pet import __version__ as _cur
+    # 模拟版本必须比当前**产品版本**新（写死必腐坏）
+    from pet.product import PRODUCT_VERSION as _cur
     _parts = [int(x) for x in _cur.split(".")]
     _parts[-1] += 1
     newer = ".".join(str(x) for x in _parts)

@@ -21,8 +21,10 @@ from pathlib import Path
 from typing import Callable
 
 from . import __version__
+from .product import PRODUCT_VERSION
 
-APP_VERSION = __version__
+# 更新检测基准 = TeaEggPet 自己的版本（不是宿主内核版本，见 pet/product.py）
+APP_VERSION = PRODUCT_VERSION
 REPO = 'zhuliu127/TeaEggPet'
 RELEASE_API = f'https://api.github.com/repos/{REPO}/releases/latest'
 REPO_URL = f'https://github.com/{REPO}'

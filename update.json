@@ -1,6 +1,6 @@
 {
-  "version": "4.4.0",
-  "html_url": "https://teaeggbiliai.dpdns.org/blog/",
-  "notes": "TeaEggPet 桌面桌宠：出门溜达 / 发一张自拍 / 本地 ComfyUI + Qwen-Image 2.1 出图。最新发布包与素材见博客下载页，源码见 https://github.com/zhuliu127/TeaEggPet",
+  "version": "1.1.0",
+  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases/tag/v1.1",
+  "notes": "TeaEggPet v1.1：修复溜达「每 N 分钟报一句」只报一次；更新页下载入口改为博客，作者账号更新。下载见 https://teaeggbiliai.dpdns.org/blog/",
   "assets": {}
 }

@@ -68,7 +68,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__
+from . import __version__ as kernel_version
+from .product import PRODUCT_VERSION
 from . import autostart as autostart_mod
 from . import catalog
 from . import harness_launcher as harness_mod
@@ -355,7 +356,7 @@ class ModernSettingsDialog(QDialog):
         sidebar_layout.addWidget(self.sidebar, 1)
         # 全局兜底入口（命令而非偏好项，故放侧栏底部；实现在 settings_reset_defaults.py）。
         settings_reset_defaults.create_reset_button(self, sidebar_layout)
-        self.version_footer = QLabel(f"版本 v{__version__}", sidebar_pane)
+        self.version_footer = QLabel(f"版本 v{PRODUCT_VERSION} · 内核 {kernel_version}", sidebar_pane)
         self.version_footer.setObjectName("settingsVersion")
         self.version_footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.version_footer.setToolTip("当前运行版本")

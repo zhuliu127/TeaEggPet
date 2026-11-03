@@ -63,8 +63,9 @@ def _version_tuple(text: str) -> tuple[int, ...]:
 
 def app_supports(app_min: str) -> bool:
     """当前应用版本是否满足包的 ``app_min``（不满足的包显示但置灰，不隐藏）。"""
-    from .updater import APP_VERSION
-    have, want = _version_tuple(APP_VERSION), _version_tuple(app_min or "0")
+    # app_min 比的是宿主内核版本，不是 TeaEggPet 的产品版本
+    from . import __version__ as kernel_version
+    have, want = _version_tuple(kernel_version), _version_tuple(app_min or "0")
     n = max(len(have), len(want))
     return have + (0,) * (n - len(have)) >= want + (0,) * (n - len(want))
 

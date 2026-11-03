@@ -18,7 +18,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__, updater
+from . import __version__ as kernel_version, updater
+from .product import PRODUCT_VERSION
 from .settings_about import build_author_section
 
 
@@ -45,7 +46,7 @@ class UpdatePage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(16)
         intro = QLabel(
-            f"当前版本 v{__version__}。更新检查会优先使用 GitHub API，连接失败时自动切换到 CDN 镜像。",
+            f"当前版本 v{PRODUCT_VERSION}（内核 {kernel_version}）。更新检查会优先使用 GitHub API，连接失败时自动切换到 CDN 镜像。",
             self,
         )
         intro.setWordWrap(True)
@@ -57,7 +58,7 @@ class UpdatePage(QWidget):
         status_layout = QVBoxLayout(status_card)
         status_layout.setContentsMargins(16, 14, 16, 14)
         status_layout.setSpacing(8)
-        self.version_label = QLabel(f"当前版本  v{__version__}", status_card)
+        self.version_label = QLabel(f"当前版本  v{PRODUCT_VERSION}", status_card)
         self.version_label.setObjectName("updateCurrentVersion")
         self.status_label = QLabel("尚未检查更新", status_card)
         self.status_label.setObjectName("updateStatus")
@@ -143,7 +144,7 @@ class UpdatePage(QWidget):
         self.manual_button.setEnabled(bool(result.get("html_url")))
         if not updater.is_newer(tag):
             self.install_button.setEnabled(False)
-            self._set_state(f"已经是最新版本（v{__version__}）。", checking=False)
+            self._set_state(f"已经是最新版本（v{PRODUCT_VERSION}）。", checking=False)
             self.notes_label.setText("当前没有可用更新。")
             return
         asset = updater.select_windows_installer(result, include_chat=self.include_chat)
