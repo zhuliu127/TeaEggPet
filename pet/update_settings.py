@@ -214,8 +214,9 @@ class UpdatePage(QWidget):
         self.window().close()
 
     def open_download_page(self) -> None:
-        url = str((self.release or {}).get("html_url") or updater.REPO_URL)
-        QDesktopServices.openUrl(QUrl(url))
+        # 下载页固定指向作者自己的站点：GitHub Release 只放发布包，
+        # 博客放软件 / 素材包 / 人物图，都是同一套东西的最新版。
+        QDesktopServices.openUrl(QUrl(updater.DOWNLOAD_PAGE_URL))
 
     def _set_state(self, text: str, *, checking: bool) -> None:
         self.status_label.setText(text)

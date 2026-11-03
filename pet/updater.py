@@ -23,10 +23,13 @@ from typing import Callable
 from . import __version__
 
 APP_VERSION = __version__
-REPO = 'MerZlin/dsh-pet-indesktop'
+REPO = 'zhuliu127/TeaEggPet'
 RELEASE_API = f'https://api.github.com/repos/{REPO}/releases/latest'
 REPO_URL = f'https://github.com/{REPO}'
-QUARK_PAN_URL = 'https://pan.quark.cn/s/68fc681ae486'
+# 自己的下载页（博客）。手动更新的「打开下载页」与右键菜单的下载入口都走这里。
+DOWNLOAD_PAGE_URL = 'https://teaeggbiliai.dpdns.org/blog/'
+# 兼容旧引用（菜单/共享模块历史上用的是夸克网盘链接）
+QUARK_PAN_URL = DOWNLOAD_PAGE_URL
 _UPDATE_JSON_URLS = (
     f'https://cdn.jsdelivr.net/gh/{REPO}@main/update.json',
     f'https://fastly.jsdelivr.net/gh/{REPO}@main/update.json',
@@ -84,6 +87,11 @@ def _fetch_json(url: str, timeout: float):
         return None
 
 
+# 角色素材包（144MB+）仍托管在宿主上游仓库的 releases 里，下载地址不能被
+# REPO 改成自己的仓库后判成不可信——这里显式保留素材源。
+_ASSET_REPOS = (REPO, 'MerZlin/dsh-pet-indesktop')
+
+
 def _trusted_https_url(url: str) -> bool:
     try:
         parsed = urllib.parse.urlparse(str(url))
@@ -94,7 +102,7 @@ def _trusted_https_url(url: str) -> bool:
     host = parsed.hostname.lower().rstrip('.')
     if host in _TRUSTED_ASSET_HOSTS:
         if host.endswith('github.com') and host == 'github.com':
-            return f'/{REPO}/' in parsed.path or parsed.path.startswith(f'/{REPO}/releases/')
+            return any(f'/{repo}/' in parsed.path for repo in _ASSET_REPOS)
         return True
     return False
 

@@ -53,7 +53,7 @@ def test_settings_update_page_does_not_write_config(tmp_path, monkeypatch):
         "notes": "notes",
         "assets": {},
         "asset_details": {},
-        "html_url": "https://github.com/MerZlin/dsh-pet-indesktop/releases",
+        "html_url": "https://github.com/zhuliu127/TeaEggPet/releases",
     }
     page._on_check_finished(release)
     assert page.status_label.text().startswith(f"发现 v{newer}")

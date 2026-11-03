@@ -12,12 +12,13 @@ from .context_menus.icons import vector_widget_icon
 from .settings_widgets import SettingsSection
 
 AUTHOR_ACCOUNTS = (
-    ("BiliBili", "@張墨林"),
-    ("BiliBili", "@快乐小咸鱼a"),
-    ("抖音", "@Eager"),
-    ("GitHub", "@MerZlin"),
+    ("BiliBili", "@茶叶蛋调查员协会", None),
+    ("BiliBili", "@TeaEgg233", None),
+    ("抖音", "@TeaEgg", None),
+    ("GitHub", "@zhuliu127", "https://github.com/zhuliu127"),
+    ("博客", "teaeggbiliai.dpdns.org/blog", "https://teaeggbiliai.dpdns.org/blog/"),
 )
-GITHUB_PROFILE = "https://github.com/MerZlin"
+GITHUB_PROFILE = "https://github.com/zhuliu127"
 
 
 def build_author_section(parent: QWidget | None = None) -> SettingsSection:
@@ -28,7 +29,7 @@ def build_author_section(parent: QWidget | None = None) -> SettingsSection:
     若在这里钉 ``modernDark``，跟随系统主题就会盖掉设置窗自己选的那一档。
     分区不写入 Config，也不参与重置写回。
     """
-    rows = [_account_row(platform, handle) for platform, handle in AUTHOR_ACCOUNTS]
+    rows = [_account_row(platform, handle, url) for platform, handle, url in AUTHOR_ACCOUNTS]
     return SettingsSection("作者账号", rows, parent)
 
 
@@ -48,7 +49,7 @@ class AuthorRow(QWidget):
         self.hint_label = QLabel(handle, self)
 
 
-def _account_row(platform: str, handle: str) -> QWidget:
+def _account_row(platform: str, handle: str, url: str | None = None) -> QWidget:
     row = AuthorRow(platform, handle)
     layout = QHBoxLayout(row)
     layout.setContentsMargins(16, 10, 16, 10)
@@ -67,9 +68,9 @@ def _account_row(platform: str, handle: str) -> QWidget:
     copy = _button(row, "copy", f"复制 {platform} 账号 {handle}")
     copy.clicked.connect(lambda: _copy_account(handle, copy))
     layout.addWidget(copy)
-    if platform == "GitHub":
-        link = _button(row, "external_link", "打开 GitHub 主页")
-        link.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(GITHUB_PROFILE)))
+    if url:
+        link = _button(row, "external_link", f"打开 {platform} 主页")
+        link.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(url)))
         layout.addWidget(link)
     return row
 

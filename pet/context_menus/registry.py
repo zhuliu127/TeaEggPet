@@ -301,7 +301,7 @@ def _build_github(menu, _pet):
 def _build_quark(menu, _pet):
     return add_action(
         menu,
-        "夸克网盘下载",
+        "博客下载页",
         "download",
         lambda: QDesktopServices.openUrl(QUrl(QUARK_PAN_URL)),
         close_on_trigger=True,

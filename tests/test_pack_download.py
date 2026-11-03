@@ -663,7 +663,7 @@ def test_registry_allows_same_version_in_two_resolutions():
     """同版本号的 640 与 720 是两条产品线，不是重复包（去重键含分辨率）。"""
     base = {"schema": 1, "id": "shenshen", "variant": "base", "version": "1.0.0",
             "pipeline": "unblend-white-v6", "format": "lossless-frame-v1",
-            "parts": [{"name": "core", "urls": ["https://github.com/MerZlin/dsh-pet-indesktop/releases/download/x/y.zip"],
+            "parts": [{"name": "core", "urls": ["https://github.com/zhuliu127/TeaEggPet/releases/download/x/y.zip"],
                        "bytes": 10, "sha256": "a" * 64}]}
     r640 = dict(base, name="640", canvas=[640, 360])
     r720 = dict(base, name="720", canvas=[1280, 720])
@@ -988,3 +988,33 @@ def test_http_404_switches_url_without_retry(tmp_path):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_repo_packs_index_stays_parseable():
+    """仓库自带的 packs-index.json 必须过校验。
+
+    素材包仍托管在宿主上游仓库的 releases；`updater.REPO` 换成自己的仓库后，
+    校验若只认新仓库会把整份清单判成「不受信任」，角色页直接不可用。
+    """
+    import json
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    data = json.loads((root / "packs-index.json").read_text(encoding="utf-8"))
+    packs = pd.parse_registry(data)
+    assert packs, "清单里至少应有一组角色包"
+
+
+def test_repo_packs_index_stays_parseable():
+    """仓库自带的 packs-index.json 必须过校验。
+
+    素材包仍托管在宿主上游仓库的 releases；`updater.REPO` 换成自己的仓库后，
+    校验若只认新仓库会把整份清单判成「不受信任」，角色页直接不可用。
+    """
+    import json
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    data = json.loads((root / "packs-index.json").read_text(encoding="utf-8"))
+    packs = pd.parse_registry(data)
+    assert packs, "清单里至少应有一组角色包"

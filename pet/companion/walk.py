@@ -61,7 +61,7 @@ class WalkService(QObject):
         self._hint = ""
         self._msg_timer = QTimer(self)
         self._msg_timer.setSingleShot(True)
-        self._msg_timer.timeout.connect(lambda: self._narrate("during"))
+        self._msg_timer.timeout.connect(self._on_msg_tick)
         self._end_timer = QTimer(self)
         self._end_timer.setSingleShot(True)
         self._end_timer.timeout.connect(lambda: self.stop("timeout"))
@@ -71,6 +71,7 @@ class WalkService(QObject):
         self._popping_selfie = False
         self._closed = False
         self._last_message = ""
+        self._last_message_at: datetime | None = None
 
     # ---------------------------------------------------------------- 状态
     @property
@@ -131,9 +132,7 @@ class WalkService(QObject):
         self._walk_timer.start(6000)
         QTimer.singleShot(800, self._nudge_walk)
         QTimer.singleShot(5000, lambda: self._narrate("start"))
-        every_ms = max(1, int(self.store.get("companion_walk_message_every_min", 4) or 4)) * 60000
-        if minutes * 60000 > every_ms * 1.2:
-            self._msg_timer.start(every_ms)
+        self._schedule_message()
         self._end_timer.start(minutes * 60000)
         self.changed.emit()
         log.info("开始溜达：%s 分钟", minutes)
@@ -163,6 +162,39 @@ class WalkService(QObject):
 
     def toggle(self) -> dict[str, Any]:
         return self.stop("hotkey") if self.walking else self.start()
+
+    # ------------------------------------------------------------ 途中消息
+    def _message_interval_ms(self) -> int:
+        """隔多久报一句：分钟 → 毫秒（最小 1 分钟）。"""
+        try:
+            every = int(self.store.get("companion_walk_message_every_min", 4) or 4)
+        except (TypeError, ValueError):
+            every = 4
+        return max(1, every) * 60000
+
+    def _schedule_message(self) -> None:
+        """排下一次「报一句」。
+
+        单次定时器 + 触发后重排：``_narrate`` 里有同步的 LLM 调用（最长 45s），
+        周期定时器会在调用期间排队重入。此前这里只 ``start()`` 了一次单次定时器、
+        没有任何地方重排，于是「每 4 分钟报一句」实际只报了一句（真机 bug）。
+        """
+        if not self.walking or self._ends_at is None:
+            return
+        every = self._message_interval_ms()
+        left_ms = (self._ends_at - datetime.now()).total_seconds() * 1000
+        # 剩余时间还不够一个间隔就不排了，免得刚回家又补一句
+        if left_ms <= every * 1.2:
+            return
+        self._msg_timer.start(every)
+
+    def _on_msg_tick(self) -> None:
+        if not self.walking:
+            return
+        try:
+            self._narrate("during")
+        finally:
+            self._schedule_message()
 
     # ---------------------------------------------------------------- 走路
     def _nudge_walk(self) -> None:
@@ -236,9 +268,15 @@ class WalkService(QObject):
         if not text:
             item = (ctx or {}).get("item") or {}
             text = f"{item.get('activity') or '在外面走走'}，{item.get('scene') or item.get('location') or '附近'}～"
-        if text == self._last_message:
+        now = datetime.now()
+        recent = (self._last_message_at is not None
+                  and (now - self._last_message_at).total_seconds() < 90)
+        if text == self._last_message and recent:
+            # 同一句只在 90s 内去重：LLM 失败时回退文案是固定的，
+            # 按无限期去重会让后续每一句都被吞掉（真机表现＝只报一次）
             return
         self._last_message = text
+        self._last_message_at = now
         self._notify(self._pet_name(), text)
         self._say(text, sticky_ms=8000)
 

@@ -63,8 +63,9 @@ def test_author_section_sits_on_the_updates_page(tmp_path, monkeypatch, include_
         app.processEvents()
         page = dialog.pages.currentWidget()
         before = copy.deepcopy(cfg.data)
-        for platform, handle in [("BiliBili", "@張墨林"), ("BiliBili", "@快乐小咸鱼a"),
-                                 ("抖音", "@Eager"), ("GitHub", "@MerZlin")]:
+        for platform, handle in [("BiliBili", "@茶叶蛋调查员协会"), ("BiliBili", "@TeaEgg233"),
+                                 ("抖音", "@TeaEgg"), ("GitHub", "@zhuliu127"),
+                                 ("博客", "teaeggbiliai.dpdns.org/blog")]:
             assert any(label.text() == handle for label in page.findChildren(QLabel))
             button = next(button for button in page.findChildren(QPushButton)
                           if button.accessibleName() == f"复制 {platform} 账号 {handle}")
@@ -73,7 +74,11 @@ def test_author_section_sits_on_the_updates_page(tmp_path, monkeypatch, include_
         link = next(button for button in page.findChildren(QPushButton)
                     if button.accessibleName() == "打开 GitHub 主页")
         QTest.mouseClick(link, Qt.MouseButton.LeftButton)
-        assert opened == ["https://github.com/MerZlin"]
+        blog = next(button for button in page.findChildren(QPushButton)
+                    if button.accessibleName() == "打开 博客 主页")
+        QTest.mouseClick(blog, Qt.MouseButton.LeftButton)
+        assert opened == ["https://github.com/zhuliu127",
+                          "https://teaeggbiliai.dpdns.org/blog/"]
         assert cfg.data == before
     finally:
         app.clipboard().setText(previous_clipboard)
