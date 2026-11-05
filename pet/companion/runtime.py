@@ -205,7 +205,9 @@ def _warmup_tts(app) -> None:
         store = CompanionStore(app.config)
         cfg = tts_mod.tts_config(store)
         if not cfg.get("enabled"):
+            log.info("本地语音预热跳过：没开「用本地 GPT-SoVITS 念出来」")
             return
+        log.info("本地语音预热开始（服务 %s）", cfg.get("api") or "未填")
         bridge = _WarmupBridge(store)
 
         def run() -> None:
@@ -224,11 +226,11 @@ def _warmup_tts(app) -> None:
                     tts_mod.ensure_weights(ready)
                     _precache_guarded(app, store, ready, reason="启动预热")
             except Exception:  # noqa: BLE001
-                log.debug("本地语音预热失败", exc_info=True)
+                log.info("本地语音预热失败", exc_info=True)
 
         threading.Thread(target=run, name="companion-tts-warmup", daemon=True).start()
     except Exception:  # noqa: BLE001
-        log.debug("本地语音预热失败", exc_info=True)
+        log.info("本地语音预热失败", exc_info=True)
 
 
 def _self_talk_texts(app) -> list[str]:
@@ -283,16 +285,18 @@ def _precache_self_talk(app, store, cfg: dict, *, reason: str = "") -> int:
 
         texts = _self_talk_texts(app)
         if not texts:
+            log.info("点击台词预合成跳过：没读到台词名单")
             return 0
         done = tts_mod.precache_texts(cfg, texts)
         if done:
             log.info("点击台词已预合成 %d 句，之后点击直接播缓存%s",
                      done, f"（{reason}）" if reason else "")
         else:
-            log.debug("点击台词缓存已是最新%s", f"（{reason}）" if reason else "")
+            log.info("点击台词缓存已是最新（%d 句名单）%s",
+                     len(texts), f"（{reason}）" if reason else "")
         return done
     except Exception:  # noqa: BLE001
-        log.debug("预合成点击台词失败", exc_info=True)
+        log.info("预合成点击台词失败", exc_info=True)
         return 0
 
 
