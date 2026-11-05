@@ -1,6 +1,6 @@
 {
-  "version": "1.1.0",
-  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases/tag/v1.1",
-  "notes": "TeaEggPet v1.1：修复溜达「每 N 分钟报一句」只报一次；更新页下载入口改为博客，作者账号更新。下载见 https://teaeggbiliai.dpdns.org/blog/",
+  "version": "1.4.4",
+  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases",
+  "notes": "TeaEggPet v1.4.4：本地 GPT-SoVITS 语音接入——AI 对话、识屏问答、主动开口、点击台词、溜达播报都会念出来并自动播放（设置 → 语音）；点击台词改为复用已合成音频，点开即出声，不再每次现合成；修复「试听一句」提示合成成功却没声音。下载见 https://teaeggbiliai.dpdns.org/blog/",
   "assets": {}
 }

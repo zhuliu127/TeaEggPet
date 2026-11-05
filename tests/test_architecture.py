@@ -307,7 +307,9 @@ WINDOW_PY_LINE_BUDGET = 4671
 # 按文件约定只随实测校准，不为达标压行（拆分仍是待办）。
 # 2026-10-22 上调到 2722：AI 域新增「场景扮演」组的一行 claim（roleplay_enabled /
 # roleplay_scene），行本体在 _AiSettingsPage。实测 2722。
-MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2722  # 2026-10-22：场景扮演组 claim 一行
+# 2026-11-06 校准到 2723：本地 GPT-SoVITS 语音接入（1.4.x）后实测 2723，超 1 行属
+# 历史遗留（未新增页面/控件组，只是语音 tab 的字段与门控分支）。按文件约定随实测校准。
+MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2723  # 2026-11-06：本地语音接入后实测 2723
 
 
 def _read(name: str) -> str:

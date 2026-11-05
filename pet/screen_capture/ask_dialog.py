@@ -382,6 +382,23 @@ class ScreenAskDialog(QFrame):
         self._set_status("")
         text = str(reply or "").strip()
         self._append_bubble(text or "（模型没说话，再试一次？）", "assistant")
+        if text:
+            self._speak_reply(text)
+
+    def _speak_reply(self, text: str) -> None:
+        """识屏问答也算「对话」：交给陪伴扩展的本地语音统一播报（自动播放）。
+
+        精简版没有陪伴模块 / 没开本地语音时静默跳过——朗读不能影响问答本身。
+        """
+        try:
+            from ..companion import runtime as companion_runtime
+            from ..companion import tts as tts_mod
+
+            store = companion_runtime.companion_store()
+            if store is not None:
+                tts_mod.speak_text(text, store, kind="screen")
+        except Exception:  # noqa: BLE001
+            log.debug("识屏问答朗读跳过", exc_info=True)
 
     def _on_error(self, gen: int, reason: str) -> None:
         if gen != self._gen:

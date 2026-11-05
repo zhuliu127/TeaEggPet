@@ -479,6 +479,33 @@ def _schedule_music_player_warm() -> None:
     QTimer.singleShot(_MUSIC_PLAYER_WARM_DELAY_MS, _warm_music_player_paths)
 
 
+def _character_for_chat_sync(host) -> str:
+    """识屏问答落盘该用哪个角色。
+
+    ``_identity_config()`` 只长在 AppShell 上，而 ``sync_look_to_chat`` 挂在
+    PetInstance（历史遗留：直接 self._identity_config() 必然 AttributeError，
+    聊天窗没开时识屏问答就整段落不进会话）。这里按「自己 → 壳 → 壳的实例」
+    逐级找身份视图，都没有再退回主配置。
+    """
+    candidates = [host, getattr(host, "shell", None)]
+    shell = candidates[1]
+    if shell is not None:
+        candidates.append(getattr(shell, "instance", None))
+    for owner in candidates:
+        if owner is None:
+            continue
+        getter = getattr(owner, "_identity_config", None)
+        if not callable(getter):
+            continue
+        try:
+            config = getter()
+        except Exception:  # noqa: BLE001
+            continue
+        if config is not None and hasattr(config, "get"):
+            return str(config.get("character", catalog.DEFAULT_CHARACTER))
+    return str(getattr(host, "config", None).get("character", catalog.DEFAULT_CHARACTER))
+
+
 class PetInstance:
     """每窗容器 —— config/lib/win/聊天窗/设置窗/气泡与全部窗口级操作。
 
@@ -1245,8 +1272,7 @@ class PetInstance:
             # ``character`` 是每宠键：会话按角色隔离，读主配置会稳定拿到出厂默认
             # 角色，slot≠0 的宠聊天就串到默认角色的会话里（同族缺陷：进程级服务
             # 读每宠键）。身份统一经 ``_identity_config()`` 取当前呈现身份。
-            character_id = str(self._identity_config().get(
-                "character", catalog.DEFAULT_CHARACTER))
+            character_id = _character_for_chat_sync(self)
             sessions = store.list(character_id)
             if sessions:
                 session = sessions[0]
@@ -1776,6 +1802,18 @@ class AppShell:
             and self.config.get("todo_reminder_speak", False)
         )
 
+    def _local_tts_taken_over(self) -> bool:
+        """陪伴扩展的本地 GPT-SoVITS 念白是否接管了发声。
+
+        两套 TTS 各走各的播放器（这条通道是进程内音频槽，本地念白是 QMediaPlayer），
+        **不会互相排队**——同时开就是一个报时、一个念主动消息，像两个人在说话。
+        所以本地念白一开，宿主这套整体让位（报时/节日/自言自语/抽签/待办/回复朗读）。
+        """
+        try:
+            return bool(self.config.get("companion_tts_enabled", False))
+        except Exception:  # noqa: BLE001
+            return False
+
     def _chime_wanted(self) -> bool:
         # 报时自身开启，或节日语音 / 点击自言自语朗读 / 抽签语音 / 待办语音播报 /
         # 助手回复朗读需要这条音频通道（六者共用一套合成与播放，因此"通道是否存在"
@@ -1783,6 +1821,8 @@ class AppShell:
         # 语音模块未激活：整条通道不建——其它模块的「念出来」是语音提供的可选
         # 增强，模块没了增强自然失效（文字照出）。
         if not feature_activation_mod.is_active("voice"):
+            return False
+        if self._local_tts_taken_over():
             return False
         return (
             bool(self.config.get("voice_chime_enabled", False))
@@ -1818,6 +1858,8 @@ class AppShell:
         # 层的 ensure_audio_channel 另有一闸）。
         if not (feature_activation_mod.is_active("voice")
                 and feature_activation_mod.is_active("chat")):
+            return False
+        if self._local_tts_taken_over():
             return False
         return bool(self.config.get("chat_reply_voice_enabled", False))
 
@@ -1926,6 +1968,11 @@ class AppShell:
         stripped = str(text or "").strip()
         if not stripped:
             return False
+        # 本地 GPT-SoVITS 接管时，宿主这条音频通道整条不建（见 _chime_wanted），
+        # 点击台词改走本地语音；本地不可用（没配参考音频等）再落回下面的宿主通道，
+        # 至少保证"点了有声"，而不是静默。
+        if self._local_tts_taken_over() and self._speak_local_self_talk(stripped):
+            return True
         try:
             channel = self.ensure_audio_channel()
         except Exception:
@@ -1956,6 +2003,26 @@ class AppShell:
             return False
         return True
 
+    def _speak_local_self_talk(self, text: str) -> bool:
+        """点击台词交给本地 GPT-SoVITS（「好女孩……」「欧鲸鲸……」这些）。
+
+        返回 False 表示「本地这条走不通」（陪伴扩展不存在 / 没开本地语音 /
+        开关关着 / 没配参考音频），调用方会落回宿主通道——这里不抛异常：
+        一句话没念出来不该影响点击本身。
+        """
+        try:
+            from .companion import runtime as companion_runtime
+            from .companion import tts as companion_tts
+
+            store = companion_runtime.companion_store()
+            if store is None:
+                return False
+            return bool(companion_tts.speak_text(text, store, kind="self_talk"))
+        except Exception:  # noqa: BLE001
+            logging.getLogger("dsh-pet-standalone").debug(
+                "本地语音播报点击台词失败", exc_info=True)
+            return False
+
     def precache_self_talk_voice(self, reason: str = "") -> bool:
         """把还没有本地音频的点击台词（含点击动画绑定台词）交给后台补齐。
 
@@ -1969,7 +2036,24 @@ class AppShell:
         返回是否真的起了新一轮。开关关着返回 False（一个请求都不发）；上一轮没跑完
         也返回 False，但这次请求会被记为**待处理快照**，当前批结束后按它补跑一轮
         （合成期间追加的台词不会错过这一轮）。
+
+        本地 GPT-SoVITS 接管时走**另一条**：宿主这份 mp3 缓存不会被播（音色不同），
+        改把台词预合成进 ``companion/tts_cache``（见 tts.precache_texts）——点击台词
+        是固定几句，灌一次之后每次点击都是直读缓存，不用再等模型。
         """
+        if self._local_tts_taken_over():
+            # 本地 GPT-SoVITS 接管后，宿主这份预缓存不会再播（音色不同），
+            # 但点击台词照样要"点了就出声"——改走**本地合成缓存**的预热。
+            # 之前这里直接 return False，于是每句台词点下去都要现合成 2~10 秒，
+            # 听感就是「点了半天才说话、甚至像没反应」。
+            try:
+                from .companion import runtime as companion_runtime
+
+                return bool(companion_runtime.precache_self_talk_texts(
+                    self, reason=reason or "保存设置"))
+            except Exception:
+                logging.exception("本地台词语音预热失败（不影响点击朗读）")
+                return False
         if not self_talk_voice.enabled(self.config):
             # 关着时连每宠名单都不读：slot 档案的读取不该为关掉的功能付费。
             return False

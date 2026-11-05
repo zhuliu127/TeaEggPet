@@ -77,7 +77,10 @@ import time
 import uuid
 from dataclasses import dataclass
 
-import numpy as np
+try:  # HDR 通道是可选的：缺 numpy 时必须回落 GDI，而不是让整条截图链路 import 失败
+    import numpy as np
+except Exception:  # noqa: BLE001 — 打包漏收 / 精简环境
+    np = None
 from PySide6.QtGui import QColorSpace, QImage
 
 log = logging.getLogger("dsh-pet-standalone")
@@ -1226,6 +1229,8 @@ def hdr_capture_disabled() -> bool:
     每次调用都读环境变量（不缓存）：逃生门的意义就是"不用改代码、重启也不用"。
     空值 / ``0`` / ``false`` / ``no`` / ``off`` 视为没开;其余任何值都算开。
     """
+    if np is None:  # 没有 numpy 就做不了 fp16→sRGB 换算，HDR 通道直接关
+        return True
     value = os.environ.get(DISABLE_ENV, "").strip().casefold()
     return value not in ("", "0", "false", "no", "off")
 
@@ -1278,6 +1283,9 @@ def grab_hdr_sdr(screen_name=None) -> QImage | None:
     ``pixels.grab_screen_image`` 的返回值口径一致。线程安全（模块级锁串行化
     整条抓帧），不碰 Qt 事件循环。
     """
+    if np is None:  # 没有 numpy 做不了 fp16→sRGB 换算，交回调用方走 GDI
+        return None
+
     if not _platform_ok() or hdr_capture_disabled():
         return None
     try:

@@ -25,6 +25,25 @@ from .store import CompanionStore
 log = logging.getLogger(__name__)
 
 
+#: 文案上限：超过就收在最后一个句末标点上，别把半句话直接播出去。
+MAX_NARRATION_CHARS = 120
+_SENTENCE_END = "。！？～…，"
+
+
+def _clip_sentence(text: str, limit: int = MAX_NARRATION_CHARS) -> str:
+    """超长文案按标点收尾。
+
+    原来直接 ``text[:120]``，一旦模型话多就会在句子中间硬切，
+    播出来是半句话（听感就是「语音不全」）。宁可少说一句，也不说半句。
+    """
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = max(head.rfind(ch) for ch in _SENTENCE_END)
+    return head[:cut + 1].strip() if cut >= limit // 3 else head.strip()
+
+
 class _SelfieWorker(QThread):
     done = Signal(object)
     failed = Signal(str)
@@ -213,12 +232,29 @@ class WalkService(QObject):
             log.debug("触发走动失败", exc_info=True)
 
     # ---------------------------------------------------------------- 说话
-    def _say(self, text: str, sticky_ms: int = 5000) -> None:
+    def _say(self, text: str, sticky_ms: int = 5000, *, speak: bool = True) -> None:
         from . import runtime
 
+        if speak:
+            self._speak(text)
         if not runtime.bubble(str(text), int(sticky_ms)):
             log.debug("气泡没发出去（没有可用的宿主窗口）")
             log.info("%s", text)
+
+    def _speak(self, text: str) -> None:
+        """念出来：和 AI 对话共用同一个本地播放器（不打断正在念的回复）。
+
+        没开本地语音 / 没配参考音频时静默返回，气泡和通知照旧。
+        """
+        text = str(text or "").strip()
+        if not text:
+            return
+        try:
+            from . import tts as tts_mod
+
+            tts_mod.speak_text(text, self.store, kind="walk", interrupt=False)
+        except Exception:  # noqa: BLE001
+            log.debug("溜达播报失败", exc_info=True)
 
     def _notify(self, title: str, message: str) -> None:
         fn = getattr(self.app, "system_notify", None)
@@ -264,7 +300,8 @@ class WalkService(QObject):
             ], max_tokens=160, temperature=1.1, timeout=45).strip()
         except Exception:
             text = ""
-        text = "".join(ch for ch in text if ch not in "「」\"“”").strip()[:120]
+        text = "".join(ch for ch in text if ch not in "「」\"“”").strip()
+        text = _clip_sentence(text)
         if not text:
             item = (ctx or {}).get("item") or {}
             text = f"{item.get('activity') or '在外面走走'}，{item.get('scene') or item.get('location') or '附近'}～"
@@ -278,7 +315,9 @@ class WalkService(QObject):
         self._last_message = text
         self._last_message_at = now
         self._notify(self._pet_name(), text)
-        self._say(text, sticky_ms=8000)
+        # kind="start" 那句和刚出门时念的「我出门啦～大概 X 分钟后回来」说的是同一件事，
+        # 两句只隔 5 秒，念出来会连成啰嗦的一段；所以开场只出气泡 / 通知。
+        self._say(text, sticky_ms=8000, speak=(kind != "start"))
 
     # ---------------------------------------------------------------- 自拍
     def take_selfie(self, reason: str = "manual") -> None:
@@ -288,9 +327,11 @@ class WalkService(QObject):
     def _take_selfie(self, reason: str) -> None:
         if self._worker is not None:
             return
-        self._say("举起手机拍一张…", sticky_ms=8000)
+        # 拍照的过程提示只出气泡不念：这类「正在生成…」念出来很吵，
+        # 真正要念的是回来那句和照片文案
+        self._say("举起手机拍一张…", sticky_ms=8000, speak=False)
         worker = _SelfieWorker(self.store, self._hint, "walk" if reason != "manual" else "manual", self)
-        worker.status.connect(lambda text: self._say(text, sticky_ms=6000))
+        worker.status.connect(lambda text: self._say(text, sticky_ms=6000, speak=False))
         worker.done.connect(self._on_selfie_done)
         worker.failed.connect(self._on_selfie_failed)
         worker.finished.connect(self._on_worker_finished)
@@ -309,7 +350,7 @@ class WalkService(QObject):
             log.exception("弹出照片失败")
 
     def _on_selfie_failed(self, error: str) -> None:
-        self._say(f"照片没拍成：{str(error)[:60]}", sticky_ms=9000)
+        self._say(f"照片没拍成：{str(error)[:60]}", sticky_ms=9000, speak=False)
         self._notify("自拍失败", str(error)[:120])
 
     def _show_photo(self, rec: Any) -> None:

@@ -9,8 +9,11 @@ log = logging.getLogger(__name__)
 
 _app = None
 _service = None
+_proactive = None
 _settings_dialog = None
 _library_dialog = None
+_store = None
+_chat_voice_hooked = False
 
 
 def attach(app) -> None:
@@ -23,9 +26,332 @@ def attach(app) -> None:
 
             _service = WalkService(app)
             _ensure_default_hotkey(app)
+            _start_proactive(app)
+            _start_schedule_bootstrap(app)
+            _start_chat_voice(app)
+            _start_tts_warmup(app)
             log.info("陪伴扩展已就绪")
         except Exception:
             log.exception("陪伴扩展初始化失败（溜达功能不可用）")
+
+
+def _start_proactive(app) -> None:
+    """把「主动对话」挂起来（启动后过几秒才排第一条，别和开机抢资源）。"""
+    global _proactive
+    if _proactive is not None:
+        return
+    try:
+        from PySide6.QtCore import QTimer
+
+        from .proactive_chat import ProactiveChatService
+
+        _proactive = ProactiveChatService(app)
+        QTimer.singleShot(6000, _proactive.start)
+    except Exception:
+        log.exception("主动对话初始化失败（其余功能不受影响）")
+
+
+def _start_chat_voice(app) -> None:
+    """让「所有对话」都走本地语音：订阅进程级「回复完成」。
+
+    宿主的 ``ChatService.register_global_finished`` 是完整聊天窗 / 快速对话 /
+    灵动岛对话**共同的**收口点（``pet/chat_reply_voice.py`` 也是接在这里），
+    所以订阅一次就覆盖全部对话入口；这里不再往每个窗口里各埋一份。
+
+    注册的是一次性类级订阅（多窗共用），回调里**每次**现读配置，
+    所以用户在设置里开关「念出回复」不需要重新订阅。
+    """
+    global _chat_voice_hooked
+    if _chat_voice_hooked:
+        return
+    try:
+        from ..chat.service import ChatService
+    except Exception:  # noqa: BLE001
+        log.debug("没有聊天模块（无聊天打包变体），本地语音不订阅回复")
+        return
+    try:
+        ChatService.register_global_finished(_on_chat_reply)
+        _chat_voice_hooked = True
+    except Exception:  # noqa: BLE001
+        log.exception("订阅「AI 回复朗读」失败")
+
+
+def _on_chat_reply(text: str) -> None:
+    """ChatService 发来一条完整回复 → 交给统一播报队列（自动播放）。"""
+    try:
+        from . import tts as tts_mod
+
+        store = companion_store()
+        if store is None:
+            return
+        tts_mod.speak_text(text, store, kind="chat")
+    except Exception:  # noqa: BLE001
+        log.debug("朗读 AI 回复失败", exc_info=True)
+
+
+def companion_store():
+    """进程级 CompanionStore（聊天回复/识屏问答都要读同一份配置）。"""
+    global _store
+    if _store is None and _app is not None:
+        try:
+            from .store import CompanionStore
+
+            _store = CompanionStore(_app.config)
+        except Exception:  # noqa: BLE001
+            log.debug("创建 CompanionStore 失败", exc_info=True)
+            return None
+    return _store
+
+
+def _start_schedule_bootstrap(app) -> None:
+    """今天没有日程就后台补一份（不阻塞启动）。"""
+    try:
+        from PySide6.QtCore import QTimer
+
+        from . import bootstrap
+
+        QTimer.singleShot(2500, lambda: bootstrap.ensure_today(app))
+    except Exception:
+        log.exception("日程自检初始化失败")
+
+
+def _start_tts_warmup(app) -> None:
+    """念白开着时，启动后顺手把 api_v2 准备好（地址填成网页端口也能自愈）。"""
+    try:
+        from PySide6.QtCore import QTimer
+
+        from . import tts as tts_mod
+
+        # 首次合成失败（服务还没起来）也走同一条自愈路径，不用用户先去设置页
+        tts_mod.set_heal_hook(_heal_tts)
+        QTimer.singleShot(20000, lambda: _warmup_tts(app))
+    except Exception:
+        log.debug("语音预热初始化失败", exc_info=True)
+
+
+_healing = False
+
+
+def _heal_tts(cfg: dict | None = None) -> None:
+    """朗读时发现服务没起来：后台 ensure 一次，起来了就把地址写回配置。
+
+    只做一次（``_healing``），失败也静默——下一句朗读还会再触发（tts 侧 60 秒冷却）。
+    """
+    global _healing
+    if _healing:
+        return
+    store = companion_store()
+    if store is None:
+        return
+    _healing = True
+    bridge = _WarmupBridge(store)
+
+    def run() -> None:
+        global _healing
+        try:
+            from . import tts as tts_mod
+
+            conf = dict(cfg or tts_mod.tts_config(store))
+            ok, api, message = tts_mod.ensure_server(conf, wait=150.0)
+            log.info("本地语音自愈：%s", message)
+            if ok and api and api != conf.get("api"):
+                bridge.report(api)
+        except Exception:  # noqa: BLE001
+            log.debug("本地语音自愈失败", exc_info=True)
+        finally:
+            _healing = False
+
+    import threading
+
+    threading.Thread(target=run, name="companion-tts-heal", daemon=True).start()
+
+
+class _WarmupBridge:
+    """后台线程只负责探测/启动，回填配置这件事回主线程做。"""
+
+    def __init__(self, store) -> None:
+        from PySide6.QtCore import QObject, Signal
+
+        class _Bridge(QObject):
+            picked = Signal(str)
+
+        self._obj = _Bridge()
+        self._store = store
+        self._obj.picked.connect(self._save)
+
+    def report(self, api: str) -> None:
+        try:
+            self._obj.picked.emit(str(api or ""))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _save(self, api: str) -> None:
+        if not api:
+            return
+        try:
+            self._store.apply({"companion_tts_api": api})
+            log.info("本地语音已就绪：%s", api)
+        except Exception:  # noqa: BLE001
+            log.debug("保存语音地址失败", exc_info=True)
+
+
+def _warmup_tts(app) -> None:
+    import threading
+
+    try:
+        from . import tts as tts_mod
+        from .store import CompanionStore
+
+        store = CompanionStore(app.config)
+        cfg = tts_mod.tts_config(store)
+        if not cfg.get("enabled"):
+            return
+        bridge = _WarmupBridge(store)
+
+        def run() -> None:
+            try:
+                if tts_mod.probe(cfg, timeout=2.0)["state"] == "api":
+                    # 顺手把用户选的权重切好：否则第一句念白要等切权重，
+                    # 点击台词这种"点了就要出声"的场景会明显卡一下。
+                    tts_mod.ensure_weights(cfg)
+                    _precache_guarded(app, store, cfg, reason="启动预热")
+                    return
+                ok, api, message = tts_mod.ensure_server(cfg, wait=150.0)
+                log.info("本地语音预热：%s", message)
+                if ok:
+                    bridge.report(api)
+                    ready = {**cfg, "api": api}
+                    tts_mod.ensure_weights(ready)
+                    _precache_guarded(app, store, ready, reason="启动预热")
+            except Exception:  # noqa: BLE001
+                log.debug("本地语音预热失败", exc_info=True)
+
+        threading.Thread(target=run, name="companion-tts-warmup", daemon=True).start()
+    except Exception:  # noqa: BLE001
+        log.debug("本地语音预热失败", exc_info=True)
+
+
+def _self_talk_texts(app) -> list[str]:
+    """点击台词的名单（每只宠一份；legacy / overlay 两种拓扑都覆盖）。
+
+    本地语音接管后，这些句子是**固定且有限**的，值得预先合成进缓存。
+    """
+    getter = getattr(app, "_self_talk_voice_configs", None)
+    if not callable(getter):
+        return []
+    try:
+        views = getter() or []
+    except Exception:  # noqa: BLE001
+        log.debug("读取点击台词名单失败", exc_info=True)
+        return []
+    texts: list[str] = []
+    for view in views:
+        try:
+            values = view.get("self_talk_texts", []) or []
+        except Exception:  # noqa: BLE001
+            continue
+        for item in values:
+            text = str(item or "").strip()
+            if text and text not in texts:
+                texts.append(text)
+    return texts
+
+
+_precaching = False
+_precache_pending = False
+
+
+def _precache_guarded(app, store, cfg: dict, *, reason: str = "") -> int:
+    """带全局互斥的预合成：启动预热与保存设置两条路不会同时灌同一批台词。"""
+    global _precaching
+    if _precaching:
+        return 0
+    _precaching = True
+    try:
+        return _precache_self_talk(app, store, cfg, reason=reason)
+    finally:
+        _precaching = False
+
+
+def _precache_self_talk(app, store, cfg: dict, *, reason: str = "") -> int:
+    """把点击台词灌进合成缓存，返回新合成句数（调用方通常在后台线程里）。
+
+    只写缓存、不出声：用户此刻可能在干别的，不能因为预热突然开口。
+    """
+    try:
+        from . import tts as tts_mod
+
+        texts = _self_talk_texts(app)
+        if not texts:
+            return 0
+        done = tts_mod.precache_texts(cfg, texts)
+        if done:
+            log.info("点击台词已预合成 %d 句，之后点击直接播缓存%s",
+                     done, f"（{reason}）" if reason else "")
+        else:
+            log.debug("点击台词缓存已是最新%s", f"（{reason}）" if reason else "")
+        return done
+    except Exception:  # noqa: BLE001
+        log.debug("预合成点击台词失败", exc_info=True)
+        return 0
+
+
+def precache_self_talk_texts(app, *, reason: str = "") -> bool:
+    """对外：后台把点击台词预合成进缓存（非阻塞，重入直接返回 False）。
+
+    保存设置后调用一次，用户点开就能秒出——不用等一句 2~10 秒的合成。
+    """
+    global _precache_pending
+    if _precache_pending:
+        return False
+    store = companion_store()
+    if store is None:
+        return False
+    try:
+        from . import tts as tts_mod
+
+        cfg = tts_mod.tts_config(store)
+    except Exception:  # noqa: BLE001
+        return False
+    if not (cfg.get("enabled") and cfg.get("ref_audio")):
+        return False
+    if not _self_talk_texts(app):
+        return False
+    _precache_pending = True
+    import threading
+
+    def run() -> None:
+        global _precache_pending
+        try:
+            from . import tts as tts_mod
+
+            ok, api, message = tts_mod.ensure_server(cfg, wait=150.0)
+            if not ok:
+                log.info("点击台词预合成跳过：%s", message)
+                return
+            ready = {**cfg, "api": api}
+            tts_mod.ensure_weights(ready)
+            _precache_guarded(app, store, ready, reason=reason)
+        except Exception:  # noqa: BLE001
+            log.debug("点击台词预合成失败", exc_info=True)
+        finally:
+            _precache_pending = False
+
+    threading.Thread(target=run, name="companion-tts-precache", daemon=True).start()
+    return True
+
+
+def proactive():
+    """给设置页/菜单用的主动对话服务。"""
+    return _proactive
+
+
+def reload_proactive() -> None:
+    if _proactive is not None:
+        try:
+            _proactive.reload()
+        except Exception:
+            log.debug("重排主动对话失败", exc_info=True)
 
 
 def _ensure_default_hotkey(app) -> None:
@@ -161,6 +487,14 @@ def open_settings(parent=None, page: str = "") -> None:
         def _closed(_result=None):
             global _settings_dialog
             _settings_dialog = None
+            # 设置改完按新参数重排（开关 / 间隔 / 免打扰都可能变）
+            reload_proactive()
+            # 本地念白开关会决定宿主那条 TTS 通道要不要让位：立刻重算，
+            # 否则已经建好的报时 / 回复朗读会继续念，和本地语音叠在一起。
+            try:
+                host._sync_chime_service()
+            except Exception:  # noqa: BLE001
+                log.debug("重算宿主语音通道失败", exc_info=True)
 
         dialog.finished.connect(_closed)
         dialog.show()
@@ -201,7 +535,19 @@ def open_library(parent=None) -> None:
 
 
 def shutdown() -> None:
-    global _service, _settings_dialog, _library_dialog
+    global _service, _settings_dialog, _library_dialog, _proactive
+    if _proactive is not None:
+        try:
+            _proactive.stop()
+        except Exception:
+            log.debug("停止主动对话失败", exc_info=True)
+        _proactive = None
+    try:
+        from . import bootstrap as bootstrap_mod
+
+        bootstrap_mod.shutdown()
+    except Exception:
+        log.debug("关闭日程自检失败", exc_info=True)
     if _service is not None:
         try:
             _service.shutdown()

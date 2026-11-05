@@ -71,6 +71,34 @@ DEFAULTS: dict[str, Any] = {
     "companion_walk_message_every_min": 4,
     "companion_walk_auto_selfie": True,
     "companion_walk_random_after": 0,  # >0 表示每 N 分钟自己出门一次，0=关闭
+    # ---- 主动对话 ----
+    "companion_proactive_enabled": True,
+    "companion_proactive_first_minutes": 5,    # 启动后多久可能开口
+    "companion_proactive_min_minutes": 45,     # 两次之间最短
+    "companion_proactive_max_minutes": 120,    # 两次之间最长
+    "companion_proactive_quiet_hours": "0-8",  # 免打扰，支持 23:30-7:00
+    "companion_proactive_max_unanswered": 3,   # 连着几条没回就停，0=不限
+    "companion_proactive_daily_limit": 8,      # 每天最多几条，0=不限
+    "companion_proactive_prompt": "",          # 留空用内置提示词
+    "companion_proactive_use_memory": True,    # 注入长期记忆（她记得的用户信息）
+    "companion_proactive_history_count": 12,   # 参考最近几条对话，0=不参考
+    "companion_schedule_autofill": True,       # 启动时今天没日程就自动生成
+    # ---- 语音（本地 GPT-SoVITS）----
+    "companion_tts_enabled": False,
+    "companion_tts_read_proactive": True,      # 主动消息念出来
+    "companion_tts_read_chat": True,           # AI 对话回复念出来（全部对话入口）
+    "companion_tts_read_screen": True,         # 识屏问答念出来
+    "companion_tts_read_self_talk": True,      # 点击台词念出来
+    "companion_tts_read_walk": True,           # 溜达播报念出来（出门 / 途中 / 回家）
+    "companion_tts_api": "http://127.0.0.1:9880",
+    "companion_tts_dir": "D:/AI/AI Voice",
+    "companion_tts_gpt": "",                   # 留空 = 用服务当前加载的
+    "companion_tts_sovits": "",
+    "companion_tts_ref_audio": "",
+    "companion_tts_ref_text": "",
+    "companion_tts_text_lang": "zh",
+    "companion_tts_prompt_lang": "zh",
+    "companion_tts_speed": 1.0,
 }
 
 

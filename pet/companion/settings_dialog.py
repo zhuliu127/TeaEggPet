@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QThread, QTime, Qt, QUrl, Signal
+from PySide6.QtCore import QObject, QThread, QTime, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -46,6 +47,32 @@ from .schedule_table import ScheduleLinkPanel
 from .store import CompanionStore
 
 log = logging.getLogger(__name__)
+
+
+class _CallBridge(QObject):
+    """把后台线程的结果投回 GUI 线程再执行。
+
+    ``QThread.ok.connect(lambda ...)`` 是 functor 连接，PySide 不保证排队到主线程
+    （版本不同行为不同，实测有直接在工作线程里跑的）。回调里碰控件还算轻的，
+    碰 ``QMediaPlayer`` / ``QAudioOutput`` 就直接「提示有了、声音没有」——
+    设置页的「试听一句」踩的就是这个。这里用一个属于主线程的 QObject 当接收者，
+    AutoConnection 才会把调用排队回来。
+    """
+
+    invoked = Signal(object)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.invoked.connect(self._call)
+
+    def _call(self, fn: Callable[[], None]) -> None:
+        try:
+            fn()
+        except Exception:  # noqa: BLE001
+            log.exception("后台任务回调失败")
+
+    def post(self, fn: Callable[[], None]) -> None:
+        self.invoked.emit(fn)
 
 
 class _Task(QThread):
@@ -145,6 +172,7 @@ class CompanionSettingsDialog(QDialog):
         self.cfg = config
         self.store = CompanionStore(config)
         self._task: _Task | None = None
+        self._bridge: _CallBridge | None = None   # 任务结果回主线程的中转（见 _run_task）
         self.setWindowTitle("陪伴扩展 · 设置")
         self.setMinimumSize(680, 520)
         # 设置项变多以后，窗口会被内容顶到超出屏幕、把底部按钮挤出去。
@@ -166,6 +194,8 @@ class CompanionSettingsDialog(QDialog):
         self.tabs.addTab(self._scrolled(self._tab_image()), "生图接口")
         self.tabs.addTab(self._tab_schedule(), "每日日程")
         self.tabs.addTab(self._tab_walk(), "溜达")
+        self.tabs.addTab(self._tab_proactive(), "主动对话")
+        self.tabs.addTab(self._tab_voice(), "语音")
         self.tabs.addTab(self._tab_about(), "说明")
         root.addWidget(self.tabs, 1)
 
@@ -457,6 +487,9 @@ class CompanionSettingsDialog(QDialog):
         self.schedule_enabled = QCheckBox("启用（聊天与照片都会参考她此刻在做什么）")
         form.addRow("每日日程", self.schedule_enabled)
 
+        self.schedule_autofill = QCheckBox("启动时如果今天还没有日程，自动生成一份")
+        form.addRow("自动补日程", self.schedule_autofill)
+
         self.character_name = _line()
         form.addRow("角色名", self.character_name)
 
@@ -550,6 +583,416 @@ class CompanionSettingsDialog(QDialog):
         hint.setWordWrap(True)
         form.addRow("", hint)
         return page
+
+    def _tab_voice(self) -> QWidget:
+        """本地 GPT-SoVITS：模型 / 参考音频 / 语速都能自己定。"""
+        page = QWidget(self)
+        form = QFormLayout(page)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.tts_enabled = QCheckBox("用本地 GPT-SoVITS 念出来")
+        self.tts_enabled.setToolTip(
+            "开启后会关掉宿主自带的语音报时 / AI 回复朗读 —— 它们走另一条音频通道，\n"
+            "两套同时开会各念各的（一个报时、一个念主动消息）")
+        self.tts_enabled.toggled.connect(self._on_local_tts_toggled)
+        form.addRow("语音", self.tts_enabled)
+        self.tts_read_chat = QCheckBox("念出 AI 对话回复（完整聊天窗 / 快速对话 / 灵动岛）")
+        self.tts_read_chat.setToolTip(
+            "回复完成后自动合成并播放；长回复会按句切分，第一句几秒内就出声。\n"
+            "新的回复会覆盖还没念完的旧内容")
+        self.tts_read_proactive = QCheckBox("念出主动说的话")
+        self.tts_read_proactive.setToolTip("她按间隔自己开口时，同时念出来")
+        self.tts_read_screen = QCheckBox("念出截图问答的回答")
+        self.tts_read_screen.setToolTip("用截图提问时，模型的回答也念出来")
+        self.tts_read_self_talk = QCheckBox("念出点击桌宠跳出来的台词")
+        self.tts_read_self_talk.setToolTip(
+            "点一下桌宠冒出来的「好女孩……」「欧鲸鲸……」这类台词也念出来；\n"
+            "首次点击会先切一次权重，可能慢一两秒")
+        self.tts_read_walk = QCheckBox("念出出去溜达时报的那几句")
+        self.tts_read_walk.setToolTip(
+            "出门、途中「我在外面散步，风挺大」、回家这几句念出来；\n"
+            "「举起手机拍一张…」这类过程提示和报错只出气泡不念")
+        form.addRow("", self.tts_read_chat)
+        form.addRow("", self.tts_read_proactive)
+        form.addRow("", self.tts_read_screen)
+        form.addRow("", self.tts_read_self_talk)
+        form.addRow("", self.tts_read_walk)
+
+        row = QHBoxLayout()
+        self.tts_dir = QLineEdit()
+        self.tts_dir.setPlaceholderText("GPT-SoVITS 安装目录")
+        browse_dir = QPushButton("选择…")
+        browse_dir.clicked.connect(self._pick_tts_dir)
+        row.addWidget(self.tts_dir, 1)
+        row.addWidget(browse_dir)
+        form.addRow("安装目录", self._wrap(row))
+
+        self.tts_api = QLineEdit()
+        self.tts_api.setPlaceholderText("http://127.0.0.1:9880")
+        form.addRow("服务地址", self.tts_api)
+
+        self.tts_gpt = QComboBox()
+        self.tts_gpt.setEditable(True)
+        self.tts_gpt.setToolTip("留空 = 用服务当前加载的 GPT 权重")
+        form.addRow("GPT 模型", self.tts_gpt)
+
+        self.tts_sovits = QComboBox()
+        self.tts_sovits.setEditable(True)
+        self.tts_sovits.setToolTip("留空 = 用服务当前加载的 SoVITS 权重")
+        form.addRow("SoVITS 模型", self.tts_sovits)
+
+        row = QHBoxLayout()
+        self.tts_ref = QLineEdit()
+        self.tts_ref.setPlaceholderText("参考音频（3~10 秒 wav）")
+        browse_ref = QPushButton("选择…")
+        browse_ref.clicked.connect(self._pick_tts_ref)
+        row.addWidget(self.tts_ref, 1)
+        row.addWidget(browse_ref)
+        form.addRow("参考音频", self._wrap(row))
+
+        self.tts_ref_text = QLineEdit()
+        self.tts_ref_text.setPlaceholderText("参考音频里说的那句话（要和音频一致）")
+        form.addRow("参考文本", self.tts_ref_text)
+
+        row = QHBoxLayout()
+        self.tts_speed = QDoubleSpinBox()
+        self.tts_speed.setRange(0.5, 2.0)
+        self.tts_speed.setSingleStep(0.05)
+        self.tts_speed.setDecimals(2)
+        self.tts_speed.setSuffix(" 倍")
+        row.addWidget(self.tts_speed)
+        self.tts_text_lang = QComboBox()
+        for text, data in (("中文", "zh"), ("英文", "en"), ("日文", "ja"), ("中英混合", "auto")):
+            self.tts_text_lang.addItem(text, data)
+        row.addWidget(QLabel("语言"))
+        row.addWidget(self.tts_text_lang)
+        row.addStretch(1)
+        form.addRow("语速 / 语言", self._wrap(row))
+
+        row = QHBoxLayout()
+        self.tts_start_btn = QPushButton("启动 / 自动连接")
+        self.tts_start_btn.setToolTip(
+            "先在候选端口找已经在跑的 api_v2；找不到就用安装目录里的 runtime python\n"
+            "挑一个空闲端口后台启动 api_v2.py，并把地址填回上面的「服务地址」")
+        self.tts_start_btn.clicked.connect(self._start_tts_service)
+        self.tts_test_btn = QPushButton("检测服务")
+        self.tts_test_btn.clicked.connect(self._test_tts_service)
+        self.tts_play_btn = QPushButton("试听一句")
+        self.tts_play_btn.clicked.connect(self._test_tts_speak)
+        row.addWidget(self.tts_start_btn)
+        row.addWidget(self.tts_test_btn)
+        row.addWidget(self.tts_play_btn)
+        row.addStretch(1)
+        form.addRow("", self._wrap(row))
+        self.tts_status = QLabel("先确保 GPT-SoVITS 的 api_v2.py 在跑（默认 9880 端口）")
+        self.tts_status.setWordWrap(True)
+        form.addRow("", self.tts_status)
+
+        hint = QLabel(
+            "开启后：AI 对话回复、主动说的话、截图问答、点击台词、溜达播报都会用这个声音自动念出来"
+            "（长回复按句播，新回复覆盖没念完的旧内容）；同时宿主自带的语音报时 / 回复朗读会自动让位。\n"
+            "服务地址要填 api_v2.py 的地址（默认 9880），不是 webui.py 的网页地址"
+            "（9871/9872/9874 是网页界面，调不通语音）。\n"
+            "模型下拉是从安装目录下的 GPT_weights*/SoVITS_weights* 扫出来的，也可以直接手填相对路径。"
+        )
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+        return page
+
+    def _tts_form_values(self) -> dict:
+        return {
+            "companion_tts_enabled": bool(self.tts_enabled.isChecked()),
+            "companion_tts_read_chat": bool(self.tts_read_chat.isChecked()),
+            "companion_tts_read_proactive": bool(self.tts_read_proactive.isChecked()),
+            "companion_tts_read_screen": bool(self.tts_read_screen.isChecked()),
+            "companion_tts_read_self_talk": bool(self.tts_read_self_talk.isChecked()),
+            "companion_tts_read_walk": bool(self.tts_read_walk.isChecked()),
+            "companion_tts_dir": self.tts_dir.text().strip() or "D:/AI/AI Voice",
+            "companion_tts_api": self.tts_api.text().strip() or "http://127.0.0.1:9880",
+            "companion_tts_gpt": self.tts_gpt.currentText().strip(),
+            "companion_tts_sovits": self.tts_sovits.currentText().strip(),
+            "companion_tts_ref_audio": self.tts_ref.text().strip(),
+            "companion_tts_ref_text": self.tts_ref_text.text().strip(),
+            "companion_tts_speed": float(self.tts_speed.value()),
+            "companion_tts_text_lang": self.tts_text_lang.currentData() or "zh",
+        }
+
+    def _refresh_tts_models(self) -> None:
+        from . import tts as tts_mod
+
+        gpt, sovits = tts_mod.scan_models(self.tts_dir.text().strip())
+        for combo, items in ((self.tts_gpt, gpt), (self.tts_sovits, sovits)):
+            current = combo.currentText().strip()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("")
+            combo.addItems(items)
+            combo.setCurrentText(current)
+            combo.blockSignals(False)
+
+    def _pick_tts_dir(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "选择 GPT-SoVITS 安装目录", self.tts_dir.text().strip())
+        if folder:
+            self.tts_dir.setText(folder)
+            self._refresh_tts_models()
+
+    def _pick_tts_ref(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择参考音频", self.tts_dir.text().strip(),
+                                              "音频 (*.wav *.mp3 *.flac)")
+        if path:
+            self.tts_ref.setText(path)
+
+    def _on_local_tts_toggled(self, checked: bool) -> None:
+        """勾上本地念白时先说清后果：宿主的报时 / 回复朗读会被关掉。"""
+        if not checked or not self.isVisible():
+            return   # 载入配置时也会 setChecked，别把初始提示冲掉
+        host_on = []
+        for key in self.HOST_TTS_KEYS:
+            try:
+                if self.cfg.get(key, False):
+                    host_on.append(key)
+            except Exception:  # noqa: BLE001
+                continue
+        if host_on:
+            self.tts_status.setText(
+                "保存后会关掉系统语音报时 / AI 回复朗读（两套 TTS 同时开会各念各的）")
+        else:
+            self.tts_status.setText("宿主那边的 TTS 目前是关着的，不会打架")
+
+    def _adopt_tts_api(self, api: str) -> None:
+        """把探测到的真接口地址填回输入框并落盘（网页端口会被换掉）。"""
+        api = str(api or "").strip()
+        if not api:
+            return
+        if self.tts_api.text().strip().rstrip("/") != api:
+            self.tts_api.setText(api)
+        try:
+            self.store.apply({"companion_tts_api": api})
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _start_tts_service(self) -> None:
+        from . import tts as tts_mod
+
+        cfg = tts_mod.tts_config(self.store)
+        cfg.update(tts_mod.cfg_from_form(self._tts_form_values()))
+        self.tts_status.setText("正在找可用的接口；没有就在后台启动 api_v2.py（首次加载模型 30~60 秒）…")
+
+        def run():
+            return tts_mod.ensure_server(cfg, wait=150.0)
+
+        def ok(result):
+            good, api, message = result
+            if good:
+                self._adopt_tts_api(api)
+                if self.tts_enabled.isChecked():
+                    off = self._silence_host_tts()
+                    if off:
+                        message += "；已同时关掉系统语音报时 / AI 回复朗读（避免两套声音打架）"
+                else:
+                    message += "；勾上「用本地 GPT-SoVITS 念出来」并保存后，才会真的念"
+            self.tts_status.setText(message)
+
+        def bad(msg):
+            self.tts_status.setText(f"启动失败：{msg}")
+
+        self._run_task(run, ok, self.tts_start_btn, bad)
+
+    def _test_tts_service(self) -> None:
+        from . import tts as tts_mod
+
+        cfg = tts_mod.tts_config(self.store)
+        cfg.update(tts_mod.cfg_from_form(self._tts_form_values()))
+        self.tts_status.setText("正在检测…")
+
+        def run():
+            return tts_mod.describe(cfg)
+
+        def ok(text):
+            self.tts_status.setText(text)
+
+        def bad(msg):
+            self.tts_status.setText(f"检测失败：{msg}")
+
+        self._run_task(run, ok, self.tts_test_btn, bad)
+
+    def _test_tts_speak(self) -> None:
+        from . import tts as tts_mod
+
+        cfg = tts_mod.tts_config(self.store)
+        cfg.update(tts_mod.cfg_from_form(self._tts_form_values()))
+        if not cfg.get("ref_audio"):
+            self.tts_status.setText("先选参考音频")
+            return
+        self.tts_status.setText("正在准备接口并合成…")
+        preview = "这是茶叶蛋在用本地语音说话，听得清吗？"
+
+        def run():
+            # 地址填成网页端口、或者服务没开，这里都顺手纠正 / 拉起
+            ready, api, message = tts_mod.ensure_server(cfg, wait=150.0)
+            if not ready:
+                return None, message
+            cfg["api"] = api
+            tts_mod.apply_weights(cfg)
+            # 注意：合成结果可能直接来自缓存（同一句话试听第二次），
+            # 但播放链路必须和平时念白一致，所以下面统一交给 LocalSpeaker。
+            data, err = tts_mod.synthesize_ex(cfg, preview)
+            return (data, api), err
+
+        def ok(result):
+            data, api = result[0]
+            if not data:
+                self.tts_status.setText(f"合成失败：{result[1] or '没有返回音频'}")
+                return
+            self._adopt_tts_api(api)
+            # 以前这里自己养了一个 QMediaPlayer + 固定文件名的临时文件：第二次试听
+            # 同一个 URL 会沿用上一段媒体描述（duration 不刷新），表现就是
+            # 「提示合成成功却没声音」。改走统一播报出口，试听 = 平时听到的链路。
+            played = tts_mod.speaker().play_data(data, dict(cfg, api=api))
+            note = "已播放" if played else "但播放器没起来（看日志）"
+            self.tts_status.setText(
+                f"合成成功，{len(data) // 1024} KB（来自 {api}），{note}")
+
+        def bad(msg):
+            self.tts_status.setText(f"失败：{msg}")
+
+        self._run_task(run, ok, self.tts_play_btn, bad)
+
+    def _tab_proactive(self) -> QWidget:
+        page = QWidget(self)
+        form = QFormLayout(page)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.proactive_enabled = QCheckBox("让她自己开口找你（消息也会出现在「AI 对话」里）")
+        form.addRow("主动对话", self.proactive_enabled)
+
+        self.proactive_first = QSpinBox()
+        self.proactive_first.setRange(1, 240)
+        self.proactive_first.setSuffix(" 分钟")
+        form.addRow("启动后多久可能开口", self.proactive_first)
+
+        row = QHBoxLayout()
+        self.proactive_min = QSpinBox()
+        self.proactive_min.setRange(5, 720)
+        self.proactive_min.setSuffix(" 分钟")
+        self.proactive_max = QSpinBox()
+        self.proactive_max.setRange(5, 720)
+        self.proactive_max.setSuffix(" 分钟")
+        row.addWidget(QLabel("最短"))
+        row.addWidget(self.proactive_min)
+        row.addWidget(QLabel("最长"))
+        row.addWidget(self.proactive_max)
+        row.addStretch(1)
+        form.addRow("两次之间间隔", self._wrap(row))
+
+        self.proactive_quiet = QLineEdit()
+        self.proactive_quiet.setPlaceholderText("0-8（跨零点写 23:30-7:00，留空=不设免打扰）")
+        self.proactive_quiet.textChanged.connect(self._refresh_quiet_hint)
+        form.addRow("免打扰时段", self.proactive_quiet)
+        self.quiet_hint = QLabel("")
+        self.quiet_hint.setWordWrap(True)
+        form.addRow("", self.quiet_hint)
+
+        row = QHBoxLayout()
+        self.proactive_unanswered = QSpinBox()
+        self.proactive_unanswered.setRange(0, 20)
+        self.proactive_unanswered.setSuffix(" 条")
+        self.proactive_unanswered.setToolTip("连着几条没回就不再开口，0 = 不限")
+        self.proactive_daily = QSpinBox()
+        self.proactive_daily.setRange(0, 50)
+        self.proactive_daily.setSuffix(" 条")
+        self.proactive_daily.setToolTip("每天最多主动说几句，0 = 不限")
+        row.addWidget(QLabel("连续没回就停"))
+        row.addWidget(self.proactive_unanswered)
+        row.addWidget(QLabel("每天最多"))
+        row.addWidget(self.proactive_daily)
+        row.addStretch(1)
+        form.addRow("", self._wrap(row))
+
+        self.proactive_memory = QCheckBox("用「AI 对话」里记住的事（她记得你是谁、你的习惯）")
+        form.addRow("记忆", self.proactive_memory)
+
+        row = QHBoxLayout()
+        self.proactive_history = QSpinBox()
+        self.proactive_history.setRange(0, 40)
+        self.proactive_history.setSuffix(" 条")
+        self.proactive_history.setToolTip("参考最近多少条聊天记录，0 = 不参考")
+        row.addWidget(QLabel("参考最近对话"))
+        row.addWidget(self.proactive_history)
+        row.addStretch(1)
+        form.addRow("", self._wrap(row))
+
+        self.proactive_prompt = QPlainTextEdit()
+        self.proactive_prompt.setPlaceholderText("留空 = 用内置提示词（按此刻日程、人设、最近聊天生成一句话）")
+        self.proactive_prompt.setFixedHeight(150)
+        form.addRow("提示词", self.proactive_prompt)
+
+        row = QHBoxLayout()
+        self.proactive_btn = QPushButton("现在说一句")
+        self.proactive_btn.clicked.connect(self._test_proactive)
+        row.addWidget(self.proactive_btn)
+        row.addStretch(1)
+        form.addRow("", self._wrap(row))
+        self.proactive_status = QLabel("")
+        self.proactive_status.setWordWrap(True)
+        form.addRow("", self.proactive_status)
+
+        hint = QLabel(
+            "规则：启动后按「启动后多久」等一会儿再开口，之后在最短/最长之间随机；\n"
+            "免打扰时段内不会说话；连着几条没人回会自己收声（可在上面调）；\n"
+            "她说的每一句都会作为一条消息写进「AI 对话」，打开就能接着聊。"
+        )
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+        return page
+
+    def _refresh_quiet_hint(self) -> None:
+        """把「10-8」这种写法翻译成人话：几点到几点、共多少小时。"""
+        from .proactive_chat import minutes_until_window_end, parse_quiet_hours
+
+        text = self.proactive_quiet.text().strip()
+        hint = getattr(self, "quiet_hint", None)
+        if hint is None:
+            return
+        if not text:
+            hint.setText("不设免打扰：任何时间都可能开口")
+            hint.setStyleSheet("color: #7a8699;")
+            return
+        window = parse_quiet_hours(text)
+        if window is None:
+            hint.setText("格式看不懂，写成「0-8」或「23:30-7:00」")
+            hint.setStyleSheet("color: #d9534f;")
+            return
+        start, end = window
+        span = minutes_until_window_end(start, window)
+        color = "#d9534f" if span > 12 * 60 else "#7a8699"
+        note = "（超过 12 小时，确认一下是不是想写 22-8）" if span > 12 * 60 else ""
+        hint.setText(f"每天 {start // 60:02d}:{start % 60:02d} → {end // 60:02d}:{end % 60:02d}，"
+                     f"共 {span / 60:.1f} 小时不主动说话{note}")
+        hint.setStyleSheet(f"color: {color};")
+
+    def _test_proactive(self) -> None:
+        from . import runtime
+
+        service = runtime.proactive()
+        if service is None:
+            self.proactive_status.setText("主动对话没起来（陪伴扩展未初始化）")
+            return
+        self.proactive_status.setText("正在生成…")
+        self.proactive_btn.setEnabled(False)
+
+        def run():
+            return service.fire_now(reason="manual")
+
+        def ok(sent):
+            self.proactive_btn.setEnabled(True)
+            self.proactive_status.setText("已发出，看气泡和右下角通知" if sent else "这次没发（模型没配好或正忙）")
+
+        def bad(msg):
+            self.proactive_btn.setEnabled(True)
+            self.proactive_status.setText(f"失败：{msg}")
+
+        self._run_task(run, ok, self.proactive_btn, bad)
 
     def _tab_about(self) -> QWidget:
         page = QWidget(self)
@@ -714,6 +1157,48 @@ class CompanionSettingsDialog(QDialog):
             except (TypeError, ValueError):
                 widget.setValue(default)
         self.auto_selfie.setChecked(bool(s.get("companion_walk_auto_selfie", True)))
+        self.schedule_autofill.setChecked(bool(s.get("companion_schedule_autofill", True)))
+        self.proactive_enabled.setChecked(bool(s.get("companion_proactive_enabled", True)))
+        for widget, key_name, default in (
+            (self.proactive_first, "companion_proactive_first_minutes", 5),
+            (self.proactive_min, "companion_proactive_min_minutes", 45),
+            (self.proactive_max, "companion_proactive_max_minutes", 120),
+            (self.proactive_unanswered, "companion_proactive_max_unanswered", 3),
+            (self.proactive_daily, "companion_proactive_daily_limit", 8),
+        ):
+            try:
+                widget.setValue(int(s.get(key_name, default) or 0))
+            except (TypeError, ValueError):
+                widget.setValue(default)
+        self.proactive_memory.setChecked(bool(s.get("companion_proactive_use_memory", True)))
+        try:
+            self.proactive_history.setValue(int(s.get("companion_proactive_history_count", 12) or 0))
+        except (TypeError, ValueError):
+            self.proactive_history.setValue(12)
+        self.proactive_quiet.setText(str(s.get("companion_proactive_quiet_hours", "0-8") or ""))
+        self.proactive_prompt.setPlainText(str(s.get("companion_proactive_prompt", "") or ""))
+        self._refresh_quiet_hint()
+        t = s
+        self.tts_enabled.setChecked(bool(t.get("companion_tts_enabled", False)))
+        self.tts_read_chat.setChecked(bool(t.get("companion_tts_read_chat", True)))
+        self.tts_read_proactive.setChecked(bool(t.get("companion_tts_read_proactive", True)))
+        self.tts_read_screen.setChecked(bool(t.get("companion_tts_read_screen", True)))
+        self.tts_read_self_talk.setChecked(bool(t.get("companion_tts_read_self_talk", True)))
+        self.tts_read_walk.setChecked(bool(t.get("companion_tts_read_walk", True)))
+        self.tts_dir.setText(str(t.get("companion_tts_dir", "D:/AI/AI Voice") or ""))
+        self.tts_api.setText(str(t.get("companion_tts_api", "http://127.0.0.1:9880") or ""))
+        self._refresh_tts_models()
+        self.tts_gpt.setCurrentText(str(t.get("companion_tts_gpt", "") or ""))
+        self.tts_sovits.setCurrentText(str(t.get("companion_tts_sovits", "") or ""))
+        self.tts_ref.setText(str(t.get("companion_tts_ref_audio", "") or ""))
+        self.tts_ref_text.setText(str(t.get("companion_tts_ref_text", "") or ""))
+        try:
+            self.tts_speed.setValue(float(t.get("companion_tts_speed", 1.0) or 1.0))
+        except (TypeError, ValueError):
+            self.tts_speed.setValue(1.0)
+        lang = str(t.get("companion_tts_text_lang", "zh") or "zh")
+        idx = self.tts_text_lang.findData(lang)
+        self.tts_text_lang.setCurrentIndex(max(0, idx))
         self._refresh_walk_status()
         self._sync_lib_detail()
         self._refresh_plan()
@@ -743,6 +1228,18 @@ class CompanionSettingsDialog(QDialog):
             "companion_walk_max_minutes": int(self.max_minutes.value()),
             "companion_walk_message_every_min": int(self.message_every.value()),
             "companion_walk_auto_selfie": bool(self.auto_selfie.isChecked()),
+            "companion_schedule_autofill": bool(self.schedule_autofill.isChecked()),
+            "companion_proactive_enabled": bool(self.proactive_enabled.isChecked()),
+            "companion_proactive_first_minutes": int(self.proactive_first.value()),
+            "companion_proactive_min_minutes": int(self.proactive_min.value()),
+            "companion_proactive_max_minutes": int(self.proactive_max.value()),
+            "companion_proactive_max_unanswered": int(self.proactive_unanswered.value()),
+            "companion_proactive_daily_limit": int(self.proactive_daily.value()),
+            "companion_proactive_use_memory": bool(self.proactive_memory.isChecked()),
+            "companion_proactive_history_count": int(self.proactive_history.value()),
+            "companion_proactive_quiet_hours": self.proactive_quiet.text().strip() or "0-8",
+            "companion_proactive_prompt": self.proactive_prompt.toPlainText().strip(),
+            **self._tts_form_values(),
             **{f"companion_lib_{c}": e.text().strip() for c, e in self.lib_edits.items()},
             "companion_comfy_url": self.comfy_url.text().strip() or "http://127.0.0.1:8188",
             "companion_comfy_dir": self.comfy_dir.text().strip(),
@@ -764,7 +1261,10 @@ class CompanionSettingsDialog(QDialog):
 
     def _on_save(self) -> None:
         try:
-            self.store.apply(self._collect())
+            patches = self._collect()
+            self.store.apply(patches)
+            if patches.get("companion_tts_enabled"):
+                self._silence_host_tts()
             key = self.image_key.text().strip()
             if key:
                 self.store.set_image_api_key(key)
@@ -774,6 +1274,29 @@ class CompanionSettingsDialog(QDialog):
             self.accept()
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "保存失败", str(exc))
+
+    #: 宿主的几套 TTS：语音报时（含节日/点击自言自语/抽签/待办播报）、AI 回复朗读、
+    #: 台词预缓存。它们共用一条音频通道，和陪伴扩展的本地 GPT-SoVITS 不共用，
+    #: 两套同时开会各念各的（一个报时一个念主动消息）。
+    HOST_TTS_KEYS = ("voice_chime_enabled", "chat_reply_voice_enabled",
+                     "self_talk_voice_precache_enabled")
+
+    def _silence_host_tts(self) -> list[str]:
+        """本地 GPT-SoVITS 开启时关掉宿主那几套 TTS，返回被关掉的键。"""
+        changed: list[str] = []
+        for key in self.HOST_TTS_KEYS:
+            try:
+                if self.cfg.get(key, False):
+                    self.cfg.set(key, False)
+                    changed.append(key)
+            except Exception:  # noqa: BLE001
+                continue
+        if changed:
+            try:
+                self.cfg.save()
+            except Exception:  # noqa: BLE001
+                pass
+        return changed
 
     # ---------------------------------------------------------------- 动作
     def select_page(self, name: str) -> None:
@@ -800,14 +1323,28 @@ class CompanionSettingsDialog(QDialog):
             button.setEnabled(False)
         task = _Task(fn, self)
         self._task = task
+        bridge = _CallBridge(self)
+        self._bridge = bridge   # 常驻一个引用，事件还在队列里也不会被回收
 
         def done(_result=None):
             self._task = None
             if button is not None:
                 button.setEnabled(True)
 
-        task.ok.connect(lambda result: (on_ok(result), done()))
-        task.bad.connect(lambda msg: ((on_bad or self._on_task_error)(msg), done()))
+        def handle_ok(result):
+            try:
+                on_ok(result)
+            finally:
+                done()
+
+        def handle_bad(message):
+            try:
+                (on_bad or self._on_task_error)(message)
+            finally:
+                done()
+
+        task.ok.connect(lambda result: bridge.post(lambda: handle_ok(result)))
+        task.bad.connect(lambda msg: bridge.post(lambda: handle_bad(msg)))
         task.start()
 
     def _on_task_error(self, message: str) -> None:
