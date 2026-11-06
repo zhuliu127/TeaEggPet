@@ -86,6 +86,28 @@ def time_context(history,now):
         elapsed=f'距离上一条消息（{format_time(last)}）已经过去约 {format_elapsed((now-last).total_seconds())}。'
     return _TIME_NOTE.format(now=format_time(now),elapsed=elapsed)
 
+# 陪伴扩展（日程）注入钩子：由 pet.companion.runtime 在启动时注册一次。
+# chat 不 import companion（无陪伴变体、单独跑测试都要能工作），这里只认一个
+# 返回 str 的 callable；返回空串表示「今天没有日程」，注入逻辑整体跳过，
+# 输出与接钩子之前逐字节一致。
+_companion_provider = None
+
+
+def set_companion_context(provider):
+    """注册「她此刻在做什么」的提供者：provider() -> str。传 None 取消注册。"""
+    global _companion_provider
+    _companion_provider = provider
+
+
+def companion_section():
+    if _companion_provider is None:
+        return ''
+    try:
+        return str(_companion_provider() or '').strip()
+    except Exception:  # noqa: BLE001 —— 日程读失败绝不能连累聊天
+        return ''
+
+
 class PromptBuilder:
     def __init__(self,characters_root=None): self.characters_root=Path(characters_root) if characters_root else None
     def effective_system_prompt(self,settings,character_id,role_prompt=None):
@@ -95,7 +117,8 @@ class PromptBuilder:
             if prompt.strip(): return prompt.strip()
         return settings.default_system_prompt.strip()
     def build_messages(self,settings,character_id,history,user_text,role_prompt=None,now=None,memory_text=None,
-                       roleplay_enabled=None,roleplay_scene=None,roleplay_cast=None,memory_payload=None):
+                       roleplay_enabled=None,roleplay_scene=None,roleplay_cast=None,memory_payload=None,
+                       companion_context=None):
         """时间感知：历史用户消息前加发送时间标记，system 末尾附当前时间与距上条消息的间隔。
         时间取自已落盘的 ChatMessage.created_at，只在发给模型时附加，不改动会话文件。
         memory_text（user 层快照，pet/chat/memory.injection_text 渲染）追加在
@@ -110,7 +133,10 @@ class PromptBuilder:
         非空**（role_prompt → 角色 manifest 的 persona → 全局默认人设），不是
         「persona 段」字面：清空 System Prompt 且角色 manifest 无 persona 时，没有
         身份的扮演没有意义，引导与场景卡都不注入。场景/人物留空只表示不额外约束
-        设定，引导仍会追加。"""
+        设定，引导仍会追加。
+        companion_context：她「此刻在做什么」的事实段（pet/companion/schedule.chat_context
+        生成，经 set_companion_context 注册的 provider 取得）。None = 按全局 provider 取，
+        扮演开着时不取；传 '' = 该入口不要；空串一律不注入，输出与接钩子前逐字节一致。"""
         now=(now or datetime.now().astimezone()).astimezone()
         if roleplay_enabled is None:
             roleplay_enabled=bool(getattr(settings,'roleplay_enabled',False))
@@ -122,6 +148,13 @@ class PromptBuilder:
         if roleplay_enabled and system.strip():
             system=(system+'\n\n'+roleplay_context(roleplay_scene,roleplay_cast)).strip()
         system=(system+'\n\n'+time_context(history,now)).strip()
+        # 日程：紧接时间信息之后，让她知道此刻自己在哪、在做什么（用户实测：
+        # 问「在干什么」答得和当天日程无关）。扮演场景不注入——那是另一段人生，
+        # 与日常日程冲突；显式传 '' 可单独关掉（文件解读这类不该跑题的入口）。
+        if companion_context is None and not roleplay_enabled:
+            companion_context=companion_section()
+        companion_context=str(companion_context or '').strip()
+        if companion_context: system=(system+'\n\n'+companion_context).strip()
         if memory_payload is not None:
             memory_text=memory_payload.text
         memory_text=str(memory_text or '').strip()

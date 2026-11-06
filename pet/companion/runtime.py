@@ -30,6 +30,7 @@ def attach(app) -> None:
             _start_schedule_bootstrap(app)
             _start_chat_voice(app)
             _start_tts_warmup(app)
+            _hook_chat_schedule()
             log.info("陪伴扩展已就绪")
         except Exception:
             log.exception("陪伴扩展初始化失败（溜达功能不可用）")
@@ -87,6 +88,34 @@ def _on_chat_reply(text: str) -> None:
         tts_mod.speak_text(text, store, kind="chat")
     except Exception:  # noqa: BLE001
         log.debug("朗读 AI 回复失败", exc_info=True)
+
+
+def _hook_chat_schedule() -> None:
+    """让「AI 对话」知道她此刻在做什么：日程段注入 system。
+
+    背景（用户实测）：问「在干什么」，回答和当天日程（「赶新需求加班」）无关——
+    日程以前只喂给了主动对话与自拍，聊天侧只有时间和人设。
+    注册一个 provider 而不是 import 到 chat 里，是为了让 chat 保持对陪伴扩展零依赖。
+    日程没生成 / 读失败时 provider 返回空串，聊天提示词与以前逐字节一致。
+    """
+    try:
+        from ..chat import prompt as chat_prompt
+        from . import schedule as schedule_mod
+    except Exception:  # noqa: BLE001 —— 无聊天变体时跳过
+        log.debug("没有聊天模块，日程不注入对话")
+        return
+
+    def provider() -> str:
+        store = companion_store()
+        if store is None:
+            return ""
+        return schedule_mod.chat_context(store)
+
+    try:
+        chat_prompt.set_companion_context(provider)
+        log.info("日程已接入 AI 对话（问「在干什么」按当天日程回答）")
+    except Exception:  # noqa: BLE001
+        log.exception("日程接入对话失败（对话仍可用）")
 
 
 def companion_store():

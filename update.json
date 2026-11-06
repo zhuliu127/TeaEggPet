@@ -1,6 +1,6 @@
 {
-  "version": "1.4.4",
+  "version": "1.4.5",
   "html_url": "https://github.com/zhuliu127/TeaEggPet/releases",
-  "notes": "TeaEggPet v1.4.4：本地 GPT-SoVITS 语音接入——AI 对话、识屏问答、主动开口、点击台词、溜达播报都会念出来并自动播放（设置 → 语音）；点击台词改为复用已合成音频，点开即出声，不再每次现合成；修复「试听一句」提示合成成功却没声音。下载见 https://teaeggbiliai.dpdns.org/blog/",
+  "notes": "TeaEggPet v1.4.5：AI 对话和每日日程联动了——聊天时把「此刻在做什么」（现在几点、这一段在哪、在做什么、穿了什么、接下来两段）写进提示词，问「在干什么 / 忙不忙 / 穿什么」不会再答成「在桌面发呆」；完整聊天窗、快速对话、灵动岛对话都生效，场景扮演与文件解读不注入。下载见 https://teaeggbiliai.dpdns.org/blog/",
   "assets": {}
 }

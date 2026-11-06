@@ -579,6 +579,54 @@ def current_context(store, now: datetime | None = None) -> dict[str, Any] | None
     }
 
 
+def chat_context(store, now: datetime | None = None) -> str:
+    """给对话用的「她此刻在做什么」：可直接拼进 system 的一段事实。
+
+    背景（用户实测）：问「在干什么」，回答和当天日程（比如「赶新需求加班」）无关——
+    聊天侧只注入了时间与人设，日程只喂给了主动对话和自拍。这里把同一份
+    ``current_context`` 压成几句话，让聊天也落在这一天里。
+    没有今天的日程（未生成 / 关掉了）时返回 ``''``，调用方据此保持原样不注入。
+    """
+    ctx = current_context(store, now)
+    if not ctx:
+        return ""
+    item = ctx.get("item") or {}
+    activity = str(item.get("activity") or "").strip()
+    if not activity:
+        return ""
+    now = now or datetime.now()
+    head = f"【你今天的生活】现在是 {clock(now_minutes(now))}（{date_label(ctx['date'])}"
+    day_type = str(ctx.get("dayType") or "").strip()
+    head += f"，{day_type}）。" if day_type else "）。"
+    title = str(ctx.get("title") or "").strip()
+    if title and title != activity:
+        head += f"今天的主题：{title}。"
+
+    span = f"{item.get('start')}–{item.get('end')}"
+    location = str(item.get("location") or "").strip()
+    who = f"你在{location}" if location else "你"
+    body = f"此刻（{span}）{who}：{activity}"
+    detail = " ".join(str(item.get("detail") or "").split())
+    if detail:
+        body += f"——{detail[:80]}"
+    body = body.rstrip("。；，、 ")  # detail 自带句号时别叠成「。。」
+    lines = [head, body + "。"]
+
+    wear = str(item.get("outfit") or "").strip()
+    note = str(item.get("outfitNote") or "").strip()
+    if wear or note:
+        lines.append("身上穿的：" + "，".join(x for x in (wear, note) if x) + "。")
+    nxt = [str(x) for x in (ctx.get("next") or []) if str(x).strip()]
+    if nxt:
+        lines.append("接下来：" + "；".join(nxt) + "。")
+    lines.append(
+        "用户问起你在做什么、在哪、忙不忙、累不累、吃没吃饭、穿什么这类问题时，"
+        "以这段为事实，用第一人称口语回答，可以补细节和感受；"
+        "但不要声称自己没有生活或一直在陪人聊天，也不要把这份日程逐条念出来。"
+    )
+    return "\n".join(lines)
+
+
 def day_text(store, key: str | None = None) -> dict[str, Any] | None:
     day = read_day(store, key or date_key())
     if not day:

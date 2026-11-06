@@ -291,7 +291,9 @@ class FileInterpretController(QObject):
             self._session = synced
 
         messages = self._prompt_builder.build_messages(
-            settings, character_id, self._session.messages[:-1], user_text
+            settings, character_id, self._session.messages[:-1], user_text,
+            # 解读文件要聚焦正文，别掺当天日程（否则模型会顺口聊起自己在加班）
+            companion_context="",
         )
         self._request_id = self._service.send(messages, provider)
 
