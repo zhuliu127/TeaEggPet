@@ -87,7 +87,7 @@ def test_stop_shows_pet_back(service, qapp):
 
     QTest.qWait(200)              # 等「回来跑一段」那条 60ms 单次定时器
     svc._on_back_home(svc._vis_token, "user")
-    assert host.played == ["左转奔跑"], "回到桌面后要跑一段进来"
+    assert host.played == ["漂浮踏步"], "回家用轻盈的「漂浮踏步」（用户指定）"
     assert svc._hidden is False
 
 
@@ -320,4 +320,24 @@ def schedule_walk_cap() -> int:
     from pet.companion import walk as walk_mod
 
     return walk_mod._ANIM_MAX_MS
+
+def test_exit_and_enter_use_different_clips(service):
+    """出门跑、回家漂浮——两条动画各自独立挑素材。"""
+    svc, _host, _visible, _ = service
+    assert svc._run_clip_name() == "左转奔跑"
+    assert svc._enter_clip_name() == "漂浮踏步"
+
+
+def test_enter_falls_back_to_run_clip(service):
+    svc, host, _visible, _ = service
+    host.moves = ["左转奔跑", "螃蟹走路"]          # 没有漂浮类素材
+    assert svc._enter_clip_name() == "左转奔跑"
+
+
+def test_enter_plays_float_clip(service, monkeypatch):
+    svc, _host, _visible, _ = service
+    shell = _FakeOverlayShell()
+    monkeypatch.setattr(runtime_mod, "anim_host", lambda: shell)
+    svc._play_enter()
+    assert shell.played == ["漂浮踏步"]
 
