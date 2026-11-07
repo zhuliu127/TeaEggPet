@@ -170,3 +170,154 @@ def test_prompt_provider_is_schedule_only_when_not_walking(monkeypatch):
     runtime_mod._hook_chat_schedule()
     assert chat_prompt.companion_section() == "【你今天的生活】此刻在公司。"
     chat_prompt.set_companion_context(None)
+
+# ---------------------------------------------------------------- overlay 拓扑
+class _FakeSpriteLib:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def names(self) -> list[str]:          # MovieLibrary.names 是方法，不是属性
+        self.calls += 1
+        return ["漂浮踏步", "左转奔跑", "螃蟹走路"]
+
+
+class _FakeOverlayShell:
+    """overlay 壳的最小面：只有 switch_clip（没有 trigger_move / moves）。"""
+
+    def __init__(self) -> None:
+        self.played: list[str] = []
+        self.sprite = type("S", (), {})()
+        self.sprite.library = _FakeSpriteLib()
+
+    def switch_clip(self, name, link_request=False):
+        self.played.append(str(name))
+        return True
+
+
+def test_play_run_uses_overlay_shell_switch_clip(service, monkeypatch):
+    """overlay 拓扑下没有 window、sprite 也没有 trigger_move——必须走壳的 switch_clip。"""
+    svc, _host, _visible, _ = service
+    shell = _FakeOverlayShell()
+    monkeypatch.setattr(runtime_mod, "anim_host", lambda: shell)
+    svc._play_run()
+    assert shell.played == ["左转奔跑"], "overlay 拓扑下也要真的播出门动画"
+
+
+def test_clip_names_reads_sprite_library_names(service, monkeypatch):
+    svc, _host, _visible, _ = service
+    shell = _FakeOverlayShell()
+    monkeypatch.setattr(runtime_mod, "anim_host", lambda: shell)
+    assert svc._clip_names() == ["漂浮踏步", "左转奔跑", "螃蟹走路"]
+    assert svc._run_clip_name() == "左转奔跑"
+
+
+def test_anim_host_prefers_shell_with_switch_clip(monkeypatch):
+    shell = _FakeOverlayShell()
+
+    class _Win:
+        def show_bubble(self, *a, **k):
+            return True
+
+    monkeypatch.setattr(runtime_mod, "_candidates", lambda: [_Win(), shell])
+    assert runtime_mod.anim_host() is shell
+
+# ---------------------------------------------------------------- overlay 拓扑
+class _FakeSpriteLib:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def names(self) -> list[str]:          # MovieLibrary.names 是方法，不是属性
+        self.calls += 1
+        return ["漂浮踏步", "左转奔跑", "螃蟹走路"]
+
+
+class _FakeOverlayShell:
+    """overlay 壳的最小面：只有 switch_clip（没有 trigger_move / moves）。"""
+
+    def __init__(self) -> None:
+        self.played: list[str] = []
+        self.sprite = type("S", (), {})()
+        self.sprite.library = _FakeSpriteLib()
+
+    def switch_clip(self, name, link_request=False):
+        self.played.append(str(name))
+        return True
+
+
+def test_play_run_uses_overlay_shell_switch_clip(service, monkeypatch):
+    """overlay 拓扑下没有 window、sprite 也没有 trigger_move——必须走壳的 switch_clip。"""
+    svc, _host, _visible, _ = service
+    shell = _FakeOverlayShell()
+    monkeypatch.setattr(runtime_mod, "anim_host", lambda: shell)
+    svc._play_run()
+    assert shell.played == ["左转奔跑"], "overlay 拓扑下也要真的播出门动画"
+
+
+def test_clip_names_reads_sprite_library_names(service, monkeypatch):
+    svc, _host, _visible, _ = service
+    shell = _FakeOverlayShell()
+    monkeypatch.setattr(runtime_mod, "anim_host", lambda: shell)
+    assert svc._clip_names() == ["漂浮踏步", "左转奔跑", "螃蟹走路"]
+    assert svc._run_clip_name() == "左转奔跑"
+
+
+def test_anim_host_prefers_shell_with_switch_clip(monkeypatch):
+    shell = _FakeOverlayShell()
+
+    class _Win:
+        def show_bubble(self, *a, **k):
+            return True
+
+    monkeypatch.setattr(runtime_mod, "_candidates", lambda: [_Win(), shell])
+    assert runtime_mod.anim_host() is shell
+
+class _FakeLibWithDuration:
+    def __init__(self, ms) -> None:
+        self._ms = ms
+
+    def names(self):
+        return ["左转奔跑"]
+
+    def duration(self, name):
+        return self._ms
+
+
+def test_run_anim_ms_uses_clip_duration_when_valid(service, monkeypatch):
+    svc, _host, _visible, _ = service
+    shell = _FakeOverlayShell()
+    shell.sprite.library = _FakeLibWithDuration(2000.0)
+    monkeypatch.setattr(runtime_mod, "anim_host", lambda: shell)
+    assert svc._run_anim_ms(2600, factor=1.3) == 2600
+
+
+def test_run_anim_ms_keeps_a_floor(service, monkeypatch):
+    """素材很短也不能一闪而过（用户实测：1.4s 时还没进奔跑姿势就藏了）。"""
+    svc, _host, _visible, _ = service
+    shell = _FakeOverlayShell()
+    shell.sprite.library = _FakeLibWithDuration(300.0)
+    monkeypatch.setattr(runtime_mod, "anim_host", lambda: shell)
+    assert svc._run_anim_ms(2600, factor=1.3) >= 2000
+
+
+def test_run_anim_ms_falls_back_on_bogus_duration(service, monkeypatch):
+    """未播放的 clip 会报 10ms 这种脏值 —— 必须退回兜底值，不能 10ms 就藏。"""
+    svc, _host, _visible, _ = service
+    shell = _FakeOverlayShell()
+    shell.sprite.library = _FakeLibWithDuration(10.0)
+    monkeypatch.setattr(runtime_mod, "anim_host", lambda: shell)
+    assert svc._run_anim_ms(2600, factor=1.3) == 2600
+
+
+def test_run_anim_ms_caps_very_long_clip(service, monkeypatch):
+    svc, _host, _visible, _ = service
+    shell = _FakeOverlayShell()
+    shell.sprite.library = _FakeLibWithDuration(10000.0)
+    monkeypatch.setattr(runtime_mod, "anim_host", lambda: shell)
+    assert svc._run_anim_ms(2600, factor=1.3) == schedule_walk_cap()
+
+
+def schedule_walk_cap() -> int:
+    from pet.companion import walk as walk_mod
+
+    return walk_mod._ANIM_MAX_MS
+

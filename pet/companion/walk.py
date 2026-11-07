@@ -29,10 +29,15 @@ log = logging.getLogger(__name__)
 MAX_NARRATION_CHARS = 120
 _SENTENCE_END = "。！？～…，"
 
-#: 出门奔跑动画的时长（毫秒）：跑完这一段才把桌宠藏起来。
-_EXIT_ANIM_MS = 1400
-#: 回家奔跑动画的时长：先回到桌面、跑一段，再说「我回来啦」。
-_ENTER_ANIM_MS = 1200
+#: 出门/回家动画的兜底时长（毫秒）。真正用哪个数看素材实际时长——
+#: 固定 1.4s 会把「刚起步还没进奔跑姿势」的那一下就砍掉（用户实测），
+#: 所以改成按 clip 时长 × 系数，取不到时长才用这里的兜底值。
+_EXIT_ANIM_MS = 2600
+_ENTER_ANIM_MS = 1800
+#: 至少让她跑够这么久（素材很短时也不至于一闪而过）。
+_ANIM_MIN_MS = 2000
+#: 最长不超过这么久（素材特别长时别让桌宠僵在台上）。
+_ANIM_MAX_MS = 3600
 #: 挑「奔跑感」素材的名字线索（角色包里有一条「左转奔跑」）。
 _RUN_HINTS = ("奔跑", "跑", "run", "dash", "冲刺", "冲")
 
@@ -153,11 +158,15 @@ class WalkService(QObject):
         self._vis_token += 1
         return self._vis_token
 
-    def _clip_names(self) -> list[str]:
-        """当前宿主可播放的动画名（legacy 的窗直接有 moves；overlay 走 sprite 库）。"""
+    def _anim_host(self):
+        """播动画该找谁：overlay 是壳的 switch_clip，legacy 是窗自己的。"""
         from . import runtime
 
-        host = runtime.move_host()
+        return runtime.anim_host() or runtime.move_host()
+
+    def _clip_names(self) -> list[str]:
+        """当前宿主可播放的动画名（legacy 的窗直接有 moves；overlay 走 sprite 库）。"""
+        host = self._anim_host()
         if host is None:
             return []
         moves = getattr(host, "moves", None)
@@ -186,23 +195,50 @@ class WalkService(QObject):
         """播放一段奔跑动画（只做画面，不抢窗口位置）。"""
         from . import runtime
 
-        name = self._run_clip_name()
-        host = runtime.move_host()
+        host = self._anim_host()
         if host is None:
+            log.info("播放出门/回家动画：没有可播动画的宿主（拓扑不支持），跳过")
+            return
+        name = self._run_clip_name()
+        if not name:
+            log.info("播放出门/回家动画：角色包没有可用的动作素材，跳过")
             return
         switch = getattr(host, "switch_clip", None)
-        if name and callable(switch):
+        if callable(switch):
             try:
-                switch(name)
+                played = switch(name)
+                log.info("播放出门/回家动画：%s（%s）", name, "ok" if played is not False else "宿主拒绝")
                 return
             except Exception:  # noqa: BLE001
-                log.debug("播放奔跑动画失败", exc_info=True)
+                log.warning("播放奔跑动画失败（%s）", name, exc_info=True)
         nudge = getattr(host, "trigger_move", None)
-        if name and callable(nudge):
+        if callable(nudge):
             try:
                 nudge(name)
+                log.info("改用移动动画代替：%s", name)
             except Exception:  # noqa: BLE001
-                log.debug("触发移动（代替奔跑动画）失败", exc_info=True)
+                log.warning("触发移动（代替奔跑动画）失败", exc_info=True)
+
+    def _run_anim_ms(self, fallback: int, *, factor: float = 1.25,
+                     cap: int = _ANIM_MAX_MS, floor: int = _ANIM_MIN_MS) -> int:
+        """这段奔跑动画该放多久：按素材真实时长算，取不到就用兜底值。
+
+        ``MovieLibrary.duration(name)`` 给的是毫秒；乘以系数是为了让她至少跑完
+        一个完整循环（用户反馈固定 1.4s 时「还没进入奔跑姿势」就被藏了）。
+        """
+        name = self._run_clip_name()
+        try:
+            host = self._anim_host()
+            sprite = getattr(host, "sprite", None)
+            lib = getattr(sprite, "library", None) or getattr(host, "library", None)
+            duration = getattr(lib, "duration", None)
+            if name and callable(duration):
+                ms = float(duration(name) or 0.0)
+                if ms > 100:                     # 毫秒口径（<100 多半是秒口径或脏值）
+                    return int(min(cap, max(floor, ms * float(factor))))
+        except Exception:  # noqa: BLE001
+            log.debug("读动画时长失败，用兜底值", exc_info=True)
+        return int(min(cap, max(floor, fallback)))
 
     def _hide_pet(self, token: int) -> None:
         """跑完出门动画后把桌宠藏起来——就当真的出门了。"""
@@ -263,7 +299,9 @@ class WalkService(QObject):
         # 出门：先跑一段给她看，跑完就藏起来（像真的走出去了）
         self._play_run()
         token = self._bump_vis_token()
-        QTimer.singleShot(_EXIT_ANIM_MS, lambda: self._hide_pet(token))
+        wait_ms = self._run_anim_ms(_EXIT_ANIM_MS, factor=1.3)
+        QTimer.singleShot(wait_ms, lambda: self._hide_pet(token))
+        log.info("出门动画时长：%s ms", wait_ms)
         QTimer.singleShot(5000, lambda: self._narrate("start"))
         self._schedule_message()
         self._end_timer.start(minutes * 60000)
@@ -286,7 +324,9 @@ class WalkService(QObject):
         # 回家：先回到桌面，再跑一段进来，站稳了才说话（不然气泡跟着动画乱飘）
         self._show_pet()
         QTimer.singleShot(60, self._play_run)
-        QTimer.singleShot(_ENTER_ANIM_MS, lambda: self._on_back_home(token, reason))
+        wait_ms = self._run_anim_ms(_ENTER_ANIM_MS, factor=1.15, cap=2800)
+        QTimer.singleShot(wait_ms, lambda: self._on_back_home(token, reason))
+        log.info("回家动画时长：%s ms", wait_ms)
         log.info("结束溜达（%s），本轮 %s 分钟", reason, minutes)
         return {"ok": True, "minutes": minutes}
 

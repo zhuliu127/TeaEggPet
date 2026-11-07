@@ -525,6 +525,20 @@ def set_pet_visible(visible: bool) -> bool:
         return False
 
 
+def anim_host():
+    """能「播一段指定动画」的宿主。
+
+    overlay 拓扑下 ``instance.win`` 是 None、sprite 上没有 ``trigger_move``，
+    真正能播动画的是壳自己的 ``switch_clip``（内部路由到当前 sprite 的
+    behavior.play_once）。以前只走 ``move_host()``，overlay 下恒为 None，
+    于是出门/回家的奔跑动画一次都没播出来（用户实测）。
+    """
+    for obj in _candidates():
+        if callable(getattr(obj, "switch_clip", None)):
+            return obj
+    return None
+
+
 def bubble(text: str, ms: int = 6000) -> bool:
     """在当前拓扑下冒个泡；返回是否真的发出去了。"""
     win = bubble_host()
