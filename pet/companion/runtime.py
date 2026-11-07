@@ -551,6 +551,15 @@ def service():
     return _service
 
 
+def current_service():
+    """已经挂上的 WalkService；**不会**顺手 attach。
+
+    托盘菜单每次弹出前都要读一次溜达状态，那条路径不能有「读一下就顺带把整个
+    陪伴扩展启动起来」的副作用（启动顺序由 AppShell.start 决定）。
+    """
+    return _service
+
+
 def app():
     return _app
 

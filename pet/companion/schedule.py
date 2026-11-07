@@ -423,7 +423,84 @@ def persona_text(store) -> str:
     return "你是住在对方电脑里的蓝鲸女孩，说话口语、简短，偶尔犯困，但也有自己的一整天。"
 
 
-def wardrobe_prompt(store):
+#: 每天「重点安排」的素材条数：库再大也只把这一小撮推到模型眼前，
+#: 但按日期轮换，几天下来整个库都会轮到（新加的素材自然进轮换）。
+SPOTLIGHT_SCENES = 4
+SPOTLIGHT_PROPS = 6
+SPOTLIGHT_OUTFITS = 3
+
+#: 提示词里对「新素材怎么用」的示例（只是举例，不在表里也能靠描述推断）。
+_USE_HINTS = (
+    "望远镜→夜里看星星、看演出；应援棒→演唱会、漫展；痛包→逛漫展；"
+    "锅铲→做饭；手冲咖啡壶→煮咖啡；滑板→小区里、公园；"
+    "游戏手柄 / 掌机→客厅打游戏；机械键盘→写代码、直播；猫耳耳机→戴耳机打游戏、听歌；"
+    "拍立得→拍一张；便当盒→带饭、野餐；香水 / 首饰盒 / choker颈链 / 小鲸鱼发卡→出门前打扮；"
+    "复古随身听→通勤路上听歌；平板电脑→追剧、画画；魔法杖→漫展 cos"
+)
+
+
+def _day_ordinal(key: str) -> int:
+    try:
+        return datetime.strptime(str(key), "%Y-%m-%d").toordinal()
+    except (TypeError, ValueError):
+        return datetime.now().toordinal()
+
+
+def recent_usage(store, key: str, days: int = 3) -> dict[str, set[str]]:
+    """最近几天已经用过的场景 / 道具 / 服饰（轮换时把它们排到后面）。"""
+    used: dict[str, set[str]] = {"scenes": set(), "props": set(), "outfits": set()}
+    for offset in range(1, max(1, days) + 1):
+        day = read_day(store, add_days(key, -offset))
+        if not day:
+            continue
+        for item in day.get("items") or []:
+            if item.get("scene"):
+                used["scenes"].add(str(item["scene"]))
+            if item.get("outfit"):
+                used["outfits"].add(str(item["outfit"]))
+            for name in item.get("props") or []:
+                used["props"].add(str(name))
+    return used
+
+
+def _rotate(pool: list[dict[str, Any]], ordinal: int, count: int) -> list[dict[str, Any]]:
+    if not pool:
+        return []
+    if count >= len(pool):
+        return list(pool)
+    start = (ordinal * max(1, count)) % len(pool)
+    return [pool[(start + i) % len(pool)] for i in range(count)]
+
+
+def spotlight(entries, key: str, count: int, *, salt: int = 0,
+              avoid=None) -> list[dict[str, Any]]:
+    """按日期确定性轮换出一小撮「今天可以用的素材」。
+
+    为什么要有它（用户实测）：把整个库平铺给模型，它照样只挑最顺手的那几样，
+    演唱会、猫耳耳机这类「要用得上合适场合」的素材一年都轮不到；而只固定展示前
+    N 条时，**后加的素材永远进不了提示词**。按日期错位取窗口，两个问题一起解决：
+    每天换一撮、所有条目都会被轮到、新条目加进库就自动进轮换。
+    """
+    items = [e for e in (entries or []) if str(e.get("name") or "").strip()]
+    if not items or count <= 0:
+        return []
+    ordered = sorted(items, key=lambda e: str(e.get("name") or ""))
+    ordinal = _day_ordinal(key) + int(salt)
+    if count >= len(ordered):
+        return ordered
+    # 最近几天用过的排后面：这样「天天在用的那几样」不会一直霸占名额，
+    # 冷门素材反而优先被推到模型眼前。
+    block = {str(x).strip() for x in (avoid or []) if str(x).strip()}
+    fresh = [e for e in ordered if str(e["name"]) not in block]
+    stale = [e for e in ordered if str(e["name"]) in block]
+    if len(fresh) >= count:
+        return _rotate(fresh, ordinal, count)
+    picked = list(fresh)
+    picked.extend(_rotate(stale, ordinal, count - len(picked)))
+    return picked
+
+
+def wardrobe_prompt(store, key: str = ""):
     """给生成提示词用的衣柜 / 场景 / 道具段落。"""
     lib, presets, situations = wardrobe_context(store)
     if not any(lib.get(c) for c in library.CATEGORIES):
@@ -464,10 +541,43 @@ def wardrobe_prompt(store):
         bedroom = next((e for e in scenes if any(k in e["name"] for k in ("卧室", "房间"))), None)
         fields["scene"] = bedroom["name"] if bedroom else ""
     if props:
-        rows = [f"- {e['name']}" for e in props[:20]]
+        rows = []
+        for e in props[:40]:
+            desc = " ".join(str(e.get("description") or "").split())[:50]
+            rows.append(f"- {e['name']}" + (f"：{desc}" if desc else ""))
         sections.append("【她的物品】（道具库，用到时 props 填名字）\n" + "\n".join(rows))
         rules.append("- props：用到道具库里的东西时填名字，最多 2 个。")
         fields["props"] = []
+
+    # 今日重点：按日期轮换，库再大也天天在换，新素材自动进轮换；
+    # 最近几天用过的先让位（否则「卧室/客厅/睡衣」永远占满）
+    used = recent_usage(store, key) if key else {"scenes": set(), "props": set(), "outfits": set()}
+    picks = []
+    for entry in spotlight(scenes, key, SPOTLIGHT_SCENES, salt=1, avoid=used["scenes"]):
+        picks.append(f"- 场景「{entry['name']}」" + (f"：{' '.join(str(entry.get('description') or '').split())[:40]}" if entry.get("description") else ""))
+    for entry in spotlight(props, key, SPOTLIGHT_PROPS, salt=2, avoid=used["props"]):
+        picks.append(f"- 道具「{entry['name']}」" + (f"：{' '.join(str(entry.get('description') or '').split())[:40]}" if entry.get("description") else ""))
+    for entry in spotlight(outfits, key, SPOTLIGHT_OUTFITS, salt=3, avoid=used["outfits"]):
+        picks.append(f"- 服饰「{entry['name']}」")
+    if picks:
+        sections.append(
+            "【今天可以重点安排的素材】（库里的东西，按日期轮换；能安排就安排，不合适就跳过，别硬塞）\n"
+            + "\n".join(picks)
+        )
+        rules.append(
+            "- 上面【今天可以重点安排的素材】里，把合适的排进真实的活动：用到道具的那一段，activity 要真的在用它；"
+            "用到场景的那一段，location 就写那个地方。"
+        )
+    if scenes or props:
+        rules.append(
+            "- 素材要和活动对得上，别硬塞：道具只出现在真用得到的那一段（听歌、打游戏、做饭、拍照、出门……），"
+            "演唱会 / 漫展 / 商场 / 步行街 / 餐厅 / 咖啡店 / 公园这类地方要有出门和回家。"
+            f"例如：{_USE_HINTS}。"
+        )
+        rules.append(
+            "- 这一天至少用到 3 个不同场景、2 件不同道具；如果整天在家，也安排一段用得上库里东西的活动"
+            "（烤点东西、泡澡、听歌、整理首饰、拍一张照片）。"
+        )
     return "\n".join(sections), rules, fields
 
 
@@ -475,7 +585,7 @@ def build_prompt(store, key: str, day_type: dict[str, Any], hint: str = "") -> s
     name = str(store.get("companion_character_name", "她") or "她")
     persona = persona_text(store)
     recent = recent_summary(store, key)
-    sections, rules, fields = wardrobe_prompt(store)
+    sections, rules, fields = wardrobe_prompt(store, key)
     example = {"start": "00:00", "end": "07:30", "activity": "睡觉", "location": "家", **fields, "detail": ""}
     lines = [
         f"你在为角色「{name}」安排 {date_label(key)} 这一整天的日程。这份日程会作为 {name} 当天的生活背景，"

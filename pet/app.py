@@ -4891,6 +4891,88 @@ class AppShell:
                 self._pet_recovery_window = recovery
             recovery.show()
 
+    # ------------------------------------------------------------ 托盘 · 陪伴扩展
+    @staticmethod
+    def _companion_service():
+        """进程级 WalkService；陪伴扩展没挂上时返回 None（不抛、也不顺手启动）。"""
+        try:
+            from .companion import runtime as companion_runtime
+
+            return companion_runtime.current_service()
+        except Exception:  # noqa: BLE001
+            logging.debug("取陪伴扩展服务失败", exc_info=True)
+            return None
+
+    @classmethod
+    def _companion_walk_label(cls) -> str:
+        """「出去溜达 / 叫她回家」的文案（跟着 walking 状态翻转）。"""
+        svc = cls._companion_service()
+        if svc is not None and getattr(svc, "walking", False):
+            return f"叫她回家（还有 {svc.minutes_left} 分钟）"
+        return "出去溜达（回来发自拍）"
+
+    def _sync_tray_tooltip(self) -> None:
+        """托盘提示：她出门时写清「人在外面、还有几分钟回来」。"""
+        tray = self.tray
+        if tray is None:
+            return
+        svc = self._companion_service()
+        if svc is not None and getattr(svc, "walking", False):
+            tray.setToolTip(f"TeaEggPet · 她在外面溜达，约 {svc.minutes_left} 分钟后回来")
+        else:
+            tray.setToolTip("TeaEggPet · 桌面宠物")
+
+    def _add_companion_tray_menu(self, menu: QMenu, track_menu):
+        """托盘里的「陪伴扩展」子菜单（溜达 / 自拍 / 素材库 / 设置）。"""
+        sub = track_menu(menu.addMenu('陪伴扩展'))
+        walk_action = add_tray_action(sub, self._companion_walk_label(), self._tray_toggle_walk)
+        add_tray_action(sub, '发一张自拍（按此刻的日程）', self._tray_take_selfie)
+        add_tray_action(sub, '素材库与关键词…', self._tray_open_library)
+        add_tray_action(sub, '陪伴扩展设置…', self._tray_open_companion_settings)
+        return walk_action
+
+    def _tray_toggle_walk(self) -> None:
+        svc = self._companion_service()
+        if svc is None:
+            self._companion_bubble("陪伴扩展还没启动好，稍等一下再点～")
+            return
+        result = svc.toggle()
+        if isinstance(result, dict) and not result.get("ok", True):
+            self._companion_bubble(str(result.get("error") or "现在不方便出去"))
+        self._sync_tray_tooltip()
+
+    def _tray_take_selfie(self) -> None:
+        svc = self._companion_service()
+        if svc is None:
+            self._companion_bubble("陪伴扩展还没启动好，稍等一下再点～")
+            return
+        svc.take_selfie("manual")
+
+    def _tray_open_library(self) -> None:
+        try:
+            from .companion import runtime as companion_runtime
+
+            companion_runtime.open_library()
+        except Exception:  # noqa: BLE001
+            logging.exception("托盘打开素材库失败")
+
+    def _tray_open_companion_settings(self) -> None:
+        try:
+            from .companion import runtime as companion_runtime
+
+            companion_runtime.open_settings()
+        except Exception:  # noqa: BLE001
+            logging.exception("托盘打开陪伴扩展设置失败")
+
+    @staticmethod
+    def _companion_bubble(text: str, ms: int = 5000) -> None:
+        try:
+            from .companion import runtime as companion_runtime
+
+            companion_runtime.bubble(str(text), ms)
+        except Exception:  # noqa: BLE001
+            logging.debug("托盘冒泡失败", exc_info=True)
+
     def _refresh_tray_menu(self) -> None:
         """重建单托盘的菜单，逐窗列出「显示/隐藏」「退出这只」（批5.2 spike 聚合）。
 
@@ -5247,6 +5329,11 @@ class AppShell:
             add_tray_action(menu, 'AI 设置', self.instance.open_chat_settings)
         add_tray_action(menu, '桌宠设置', self.instance.open_modern_settings)
 
+        # 陪伴扩展：托盘里必须有独立入口。她出去溜达时整窗隐藏，桌面上没有可点的
+        # 地方——没有托盘入口就叫不回来（用户实测）。标签随溜达状态翻转，
+        # 在 sync_tray_checks（每次弹出前）刷新，不重建整棵菜单。
+        walk_action = self._add_companion_tray_menu(menu, track_menu)
+
         m_char = track_menu(menu.addMenu('切换角色'))
         # 勾选态标**当前身份**的角色（换角色后本菜单会重建，见 _refresh_tray_menu）；
         # 读进程级配置会让勾永远停在出厂默认那只（与岛名同源缺陷）
@@ -5277,6 +5364,9 @@ class AppShell:
                 island_action.setChecked(bool(
                     self.config.get("dynamic_island", {}).get("enabled", True)
                 ))
+            if walk_action is not None:
+                walk_action.setText(self._companion_walk_label())
+                self._sync_tray_tooltip()
 
         menu.aboutToShow.connect(sync_tray_checks)
 
