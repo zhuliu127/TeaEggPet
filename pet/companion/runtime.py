@@ -539,30 +539,61 @@ def open_settings(parent=None, page: str = "") -> None:
         log.exception("打开陪伴扩展设置失败")
 
 
-def open_library(parent=None) -> None:
-    """打开「素材库与关键词」窗口（单例）。"""
+def open_library(parent=None, *, topmost: bool = True, on_closed=None) -> None:
+    """打开「素材库与关键词」窗口（单例）。
+
+    parent 只有在**确实是 QWidget** 时才当父窗口用：overlay 拓扑下
+    ``bubble_host()`` 返回的是 OverlayShell（壳，不是 QWidget），塞给 QDialog 会抛
+    ``TypeError: QDialog.__init__(OverlayShell)``，窗口根本建不出来——照片卡上的
+    「换素材」就是这么点不动的。
+    topmost 默认开着：照片卡本身是 WindowStaysOnTop，普通窗口会被它压住，
+    看着也像「没反应」。
+    """
     global _library_dialog
     host = _app
     if host is None:
+        log.warning("素材库窗口打不开：陪伴扩展还没挂到宿主")
         return
     try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QWidget
+
         if _library_dialog is not None:
-            _library_dialog.raise_()
-            _library_dialog.activateWindow()
-            return
+            dialog = _library_dialog
+            try:
+                if not dialog.isVisible():
+                    dialog.show()          # 关过又被复用：只 raise 是叫不回来的
+                dialog.raise_()
+                dialog.activateWindow()
+                if topmost:
+                    dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+                return
+            except RuntimeError:
+                _library_dialog = None     # C++ 侧已销毁，重建
+
+        parent_widget = parent if isinstance(parent, QWidget) else None
         from .library_dialog import LibraryDialog
 
-        dialog = LibraryDialog(host.config, parent or getattr(getattr(host, "instance", None), "win", None))
+        dialog = LibraryDialog(host.config, parent_widget)
+        if topmost:
+            dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         _library_dialog = dialog
 
         def _closed(_result=None):
             global _library_dialog
             _library_dialog = None
+            if callable(on_closed):
+                try:
+                    on_closed()
+                except Exception:
+                    log.debug("素材库关闭回调失败", exc_info=True)
 
         dialog.finished.connect(_closed)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+        log.info("素材库窗口已打开（parent=%s, topmost=%s）",
+                 type(parent_widget).__name__ if parent_widget else "None", topmost)
     except Exception:
         log.exception("打开素材库窗口失败")
 
