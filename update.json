@@ -1,6 +1,6 @@
 {
-  "version": "1.4.7",
+  "version": "1.4.8",
   "html_url": "https://github.com/zhuliu127/TeaEggPet/releases",
-  "notes": "TeaEggPet v1.4.7：出门溜达变成「真的出门」——先跑一段动画再把桌宠藏起来，回来时跑回桌面；溜达期间 AI 对话知道她在外面，问「在干什么 / 什么时候回来」不会再按日程说自己在公司。另外「更新」页去掉了没法用的「下载并安装」，改为启动时自动静默检查一次更新（有新版才提醒）。下载见 https://teaeggbiliai.dpdns.org/blog/",
+  "notes": "TeaEggPet v1.4.8：托盘右键补了「陪伴扩展」——出去溜达后桌宠会从桌面消失，现在可以直接在托盘「叫她回家」、发一张自拍、进素材库/陪伴设置；每日日程会按天轮换着用素材库里的东西（演唱会、漫展、猫耳耳机这类冷门素材也会被排进合适的段落，新加的素材自动进轮换）；配套的素材库 v1.1（含 entry.json 标签）已放在博客资料库。下载见 https://teaeggbiliai.dpdns.org/blog/",
   "assets": {}
 }
