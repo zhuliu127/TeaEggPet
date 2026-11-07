@@ -49,7 +49,7 @@ from .prompt import PromptBuilder, load_character_manifest
 from . import themes as chat_themes
 from .service import ChatService
 from .session_store import SessionStore
-from .utils import _short_title
+from .utils import _short_title, format_message_time
 from ..context_menus.icons import vector_widget_icon
 
 
@@ -380,7 +380,8 @@ class MessageBubble(QFrame):
     retry_requested = Signal()
     pin_requested = Signal()  # 「钉为记忆」：把气泡原文写进对话全局记忆（pet/chat/memory）
 
-    def __init__(self, role: str, content: str = "", character_id: str = "", parent=None):
+    def __init__(self, role: str, content: str = "", character_id: str = "", parent=None,
+                 time_text: str | None = None):
         super().__init__(parent)
         self.role = role
         self.character_id = character_id
@@ -517,10 +518,32 @@ class MessageBubble(QFrame):
         error_actions_layout.addWidget(self.retry_button)
         self.error_actions.hide()
         surface_layout.addWidget(self.error_actions)
+
+        # 时间戳：放在气泡正下方（微信那种小灰字）。用户靠右、她靠左。
+        self.time = QLabel(self)
+        self.time.setObjectName("bubble-time")
+        self.time.setStyleSheet("QLabel#bubble-time { color: rgba(130,138,155,0.92);"
+                                " font-size: 11px; padding: 0 2px; }")
+        self.time.setAlignment(Qt.AlignmentFlag.AlignRight if role == "user"
+                               else Qt.AlignmentFlag.AlignLeft)
+        self.time.hide()
+        panel.addWidget(self.time)
         root.addLayout(panel, 1)
 
         if role == "user":
             root.setDirection(QHBoxLayout.Direction.RightToLeft)
+
+        self.set_time_text(format_message_time(datetime.now().isoformat())
+                           if time_text is None else time_text)
+
+    def set_time_text(self, text: str) -> None:
+        """气泡下方的时间戳；空串就整行隐藏（老会话没存时间时不占位）。"""
+        text = str(text or "").strip()
+        if not text:
+            self.time.hide()
+            return
+        self.time.setText(text)
+        self.time.show()
 
     @property
     def content(self) -> str:
@@ -1740,7 +1763,8 @@ class ChatWindow(QDialog):
             if self._hidden_count:
                 self._insert_load_earlier_row()
             for message in messages[-_PAGE_SIZE:]:
-                bubble = self._add(message.role, message.content)
+                bubble = self._add(message.role, message.content,
+                                   time_text=format_message_time(message.created_at))
                 if message.reasoning or message.activity:
                     bubble.restore_thinking(message.reasoning, message.activity)
         finally:
@@ -1787,6 +1811,7 @@ class ChatWindow(QDialog):
                 self._prepend(
                     message.role, message.content,
                     reasoning=message.reasoning, activity=message.activity,
+                    time_text=format_message_time(message.created_at),
                 )
             self._hidden_count = start
             if self._hidden_count:
@@ -1803,10 +1828,11 @@ class ChatWindow(QDialog):
             self._prepend_anchor = (anchor, anchor_y - old_value)
             QTimer.singleShot(0, self, self._apply_prepend_anchor)
 
-    def _prepend(self, role: str, text: str, *, reasoning: str = "", activity: list[str] | None = None) -> MessageBubble:
+    def _prepend(self, role: str, text: str, *, reasoning: str = "", activity: list[str] | None = None,
+                 time_text: str | None = None) -> MessageBubble:
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
-        bubble = MessageBubble(role, text, self.character_id)
+        bubble = MessageBubble(role, text, self.character_id, time_text=time_text)
         bubble.pin_requested.connect(lambda bubble=bubble: self._pin_bubble(bubble))
         if reasoning or activity:
             bubble.restore_thinking(reasoning, activity)
@@ -1855,10 +1881,10 @@ class ChatWindow(QDialog):
         if not self._bulk_loading:
             QTimer.singleShot(0, self, self._update_conversation_height)
 
-    def _add(self, role: str, text: str) -> MessageBubble:
+    def _add(self, role: str, text: str, *, time_text: str | None = None) -> MessageBubble:
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
-        bubble = MessageBubble(role, text, self.character_id)
+        bubble = MessageBubble(role, text, self.character_id, time_text=time_text)
         bubble.pin_requested.connect(lambda bubble=bubble: self._pin_bubble(bubble))
         if role == "user":
             row.addStretch(1)

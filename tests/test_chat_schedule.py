@@ -50,11 +50,11 @@ def _clean_provider():
     set_companion_context(None)
 
 
-def _store(tmp_path, title: str = "赶新需求加班") -> CompanionStore:
+def _store(tmp_path, title: str = "赶新需求加班", day_key: str = DAY_KEY) -> CompanionStore:
     cfg = Config(base=tmp_path)
     store = CompanionStore(cfg)
     schedule.write_day(store, {
-        "date": DAY_KEY, "title": title, "mood": "有点累但还行",
+        "date": day_key, "title": title, "mood": "有点累但还行",
         "dayType": {"id": "overtime", "name": "加班日"}, "items": ITEMS,
     })
     return store
@@ -182,7 +182,8 @@ def test_prompt_explicit_text_wins(tmp_path):
 
 # ---------------------------------------------------------------- runtime 钩子
 def test_runtime_hook_registers_schedule_provider(tmp_path, monkeypatch):
-    store = _store(tmp_path)
+    # provider 取的是「真实此刻」的日程，所以这份日程必须写成今天，否则隔天跑必红
+    store = _store(tmp_path, day_key=datetime.now().strftime("%Y-%m-%d"))
     monkeypatch.setattr(companion_runtime, "companion_store", lambda: store)
     companion_runtime._hook_chat_schedule()
     system = _system()

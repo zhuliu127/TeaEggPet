@@ -114,6 +114,7 @@ class ProactiveChatService(QObject):
         self._timer.timeout.connect(self._tick)
         self._busy = False
         self._stopped = True
+        self._next_at: datetime | None = None
         self._rng = random.Random()
         self._state_path = self.store.root / "proactive_state.json"
         self._state = self._read_state()
@@ -207,12 +208,28 @@ class ProactiveChatService(QObject):
         if self._stopped:
             self.start()
             return
-        if not self._busy:
-            self._schedule_next()
-            log.info("主动对话已按新设置重排")
+        if self._busy:
+            return
+        # 设置页关一次就重排一次的话，45–120 分钟的间隔永远等不到：
+        # 只要新参数还容得下原计划就原样保留（用户实测「一天只说一两次」的元凶之一）。
+        lo, hi = self.interval()
+        remain = ((self._next_at - datetime.now()).total_seconds() / 60.0
+                  if self._next_at is not None else None)
+        window = self.quiet_window()
+        now = datetime.now()
+        quiet_now = bool(window and in_quiet(now.hour * 60 + now.minute, window))
+        if remain is not None and lo <= remain <= hi and not quiet_now:
+            log.info("主动对话保持原计划：%s 再说（还有 %.0f 分钟）",
+                     self._next_at.strftime("%H:%M"), remain)
+            return
+        self._schedule_next()
+        log.info("主动对话已按新设置重排")
 
     def _arm(self, minutes: float) -> None:
-        self._timer.start(int(max(1.0, minutes) * 60000))
+        minutes = max(1.0, float(minutes))
+        self._next_at = datetime.now() + timedelta(minutes=minutes)
+        self._timer.start(int(minutes * 60000))
+        log.info("下次主动对话：%s（约 %.0f 分钟后）", self._next_at.strftime("%H:%M"), minutes)
 
     def _schedule_next(self) -> None:
         lo, hi = self.interval()
@@ -256,9 +273,12 @@ class ProactiveChatService(QObject):
         if self._busy:
             self._schedule_next()
             return
-        if self._unanswered() >= self.max_unanswered() > 0:
-            log.info("连续 %d 条没被回复，今天不再主动开口", self._unanswered())
-            self._schedule_at_next_morning()
+        unanswered = self._unanswered()
+        if unanswered >= self.max_unanswered() > 0:
+            # 以前这里直接排到明天早上，等于「一天只主动一两次」。
+            # 现在只跳过这一轮：对方可能只是暂时不在，下一轮再试。
+            log.info("连续 %d 条没被回复，这一轮先不说（下轮再试）", unanswered)
+            self._schedule_next()
             return
         try:
             self.fire_now(reason="timer")
@@ -291,7 +311,11 @@ class ProactiveChatService(QObject):
 
     # -------------------------------------------------------------- 内容
     def _unanswered(self) -> int:
-        """会话末尾连续「她说的、用户没回」的条数。"""
+        """会话末尾连续「她说的、用户没回」的条数。
+
+        快速对话 / 灵动岛 / 完整窗口可能落在不同会话文件里：只要她上次开口之后，
+        **任何**一个会话里出现过用户消息，就当他回过了（否则会误判成 4 条没人理，
+        然后一整天不再开口）。"""
         session = self._latest_session()
         if session is None:
             return 0
@@ -300,7 +324,40 @@ class ProactiveChatService(QObject):
             if str(getattr(message, "role", "")) == "user":
                 break
             count += 1
+        if count and self._replied_since(str(self._state.get("last_at") or "")):
+            return 0
         return count
+
+    def _replied_since(self, stamp: str) -> bool:
+        """她上次开口之后，用户有没有在任意会话里说过话。"""
+        raw = str(stamp or "").strip()
+        if not raw:
+            return False
+        try:
+            since = datetime.fromisoformat(raw)
+        except ValueError:
+            return False
+        try:
+            sessions = self._chat_store().list(self._character_id())
+        except Exception:  # noqa: BLE001
+            log.debug("读会话列表失败", exc_info=True)
+            return False
+        for session in sessions:
+            for message in list(getattr(session, "messages", []) or []):
+                if str(getattr(message, "role", "")) != "user":
+                    continue
+                try:
+                    when = datetime.fromisoformat(
+                        str(getattr(message, "created_at", "") or "").replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if when.tzinfo is None and since.tzinfo is not None:
+                    when = when.astimezone()
+                if when.tzinfo is not None and since.tzinfo is None:
+                    since = since.astimezone()
+                if when > since:
+                    return True
+        return False
 
     def _latest_session(self):
         try:

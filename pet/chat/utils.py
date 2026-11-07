@@ -56,3 +56,31 @@ def _short_title(session, *, localize_time: bool = True) -> str:
         return "新会话 · " + created.strftime("%H:%M")
     except (TypeError, ValueError):
         return "新会话"
+
+
+def format_message_time(created_at: str, *, now: datetime | None = None) -> str:
+    """气泡下方的时间戳（微信那种「几点几分」）。
+
+    - 今天：``15:20``
+    - 今年内：``11-06 15:20``
+    - 更早：``2025-12-31 15:20``
+    created_at 是 UTC ISO（``...Z``）或本地 naive，解析失败返回空串（不显示时间，
+    绝不因为一条脏时间把整个会话渲染搞崩）。
+    """
+    raw = str(created_at or "").strip()
+    if not raw:
+        return ""
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if stamp.tzinfo is not None:
+        stamp = stamp.astimezone()
+    current = (now or datetime.now().astimezone())
+    if current.tzinfo is not None:
+        current = current.astimezone()
+    if stamp.date() == current.date():
+        return stamp.strftime("%H:%M")
+    if stamp.year == current.year:
+        return stamp.strftime("%m-%d %H:%M")
+    return stamp.strftime("%Y-%m-%d %H:%M")

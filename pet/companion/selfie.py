@@ -154,7 +154,8 @@ def record(store, rec: dict[str, Any]) -> dict[str, Any]:
 
 
 def generate(store, hint: str = "", reason: str = "walk",
-             on_status: Callable[[str], None] | None = None) -> dict[str, Any]:
+             on_status: Callable[[str], None] | None = None,
+             overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     """拍一张，返回记录（含 path / caption / prompt）。失败抛异常。"""
     ctx = schedule.current_context(store)
     if ctx is None:
@@ -186,6 +187,21 @@ def generate(store, hint: str = "", reason: str = "walk",
     if not props and item.get("props"):
         props = list(item["props"])
         linked["props"] = props
+    # 照片卡上的「换素材」：用户手选的衣服 / 场景 / 道具优先于模型与日程
+    overrides = overrides or {}
+    if overrides.get("outfits"):
+        outfits = [str(x) for x in overrides["outfits"] if str(x).strip()]
+        if outfits:
+            linked["outfit"] = outfits[0]
+    if overrides.get("scene"):
+        scene = str(overrides["scene"]).strip()
+        if scene:
+            linked["scene"] = scene
+    if overrides.get("props"):
+        props = [str(x) for x in overrides["props"] if str(x).strip()]
+        if props:
+            linked["props"] = props
+
     situation = planned.get("situation") or (ctx or {}).get("situation") or ""
     if not situation and item:
         hit = schedule.guess_situation(item, (presets_mod.load(store).get("situation") or []))
@@ -279,6 +295,7 @@ def generate(store, hint: str = "", reason: str = "walk",
         "prompt": prompt_final,
         "keywords": composed["keywords"],
         "selected": composed["selected"],
+        "swap": dict(overrides or {}),
         "notes": composed["notes"] + [f"未找到：{x}" for x in composed["unresolved"]],
         "meta": meta,
         "planned": bool(planned.get("planned")),

@@ -49,16 +49,19 @@ class _SelfieWorker(QThread):
     failed = Signal(str)
     status = Signal(str)
 
-    def __init__(self, store: CompanionStore, hint: str, reason: str, parent=None) -> None:
+    def __init__(self, store: CompanionStore, hint: str, reason: str, parent=None,
+                 overrides: dict[str, Any] | None = None) -> None:
         super().__init__(parent)
         self._store = store
         self._hint = hint
         self._reason = reason
+        self._overrides = dict(overrides or {})
 
     def run(self) -> None:  # noqa: D102
         try:
             rec = selfie_mod.generate(self._store, self._hint, self._reason,
-                                      on_status=lambda text: self.status.emit(str(text)))
+                                      on_status=lambda text: self.status.emit(str(text)),
+                                      overrides=self._overrides or None)
             self.done.emit(rec)
         except Exception as exc:  # noqa: BLE001
             log.exception("自拍失败")
@@ -320,17 +323,19 @@ class WalkService(QObject):
         self._say(text, sticky_ms=8000, speak=(kind != "start"))
 
     # ---------------------------------------------------------------- 自拍
-    def take_selfie(self, reason: str = "manual") -> None:
-        """单独拍一张（不溜达），给照片窗的「再拍一张」和菜单用。"""
-        self._take_selfie(reason)
+    def take_selfie(self, reason: str = "manual", overrides: dict[str, Any] | None = None) -> None:
+        """单独拍一张（不溜达），给照片窗的「再拍一张 / 换素材重拍」和菜单用。"""
+        self._take_selfie(reason, overrides)
 
-    def _take_selfie(self, reason: str) -> None:
+    def _take_selfie(self, reason: str, overrides: dict[str, Any] | None = None) -> None:
         if self._worker is not None:
             return
         # 拍照的过程提示只出气泡不念：这类「正在生成…」念出来很吵，
         # 真正要念的是回来那句和照片文案
         self._say("举起手机拍一张…", sticky_ms=8000, speak=False)
-        worker = _SelfieWorker(self.store, self._hint, "walk" if reason != "manual" else "manual", self)
+        worker = _SelfieWorker(self.store, self._hint,
+                               "walk" if reason != "manual" else "manual", self,
+                               overrides=overrides)
         worker.status.connect(lambda text: self._say(text, sticky_ms=6000, speak=False))
         worker.done.connect(self._on_selfie_done)
         worker.failed.connect(self._on_selfie_failed)
@@ -381,7 +386,7 @@ class WalkService(QObject):
                              title="她发来的自拍",
                              sub=self._photo_sub(rec), assets=self._photo_assets(rec),
                              on_retake=lambda: self.take_selfie("manual"),
-                             on_library=self._open_library, on_closed=forget)
+                             on_swap=lambda rec=rec: self._open_swap(rec), on_closed=forget)
         windows.append(window)
         host = self._window()
         screen = None
@@ -437,6 +442,21 @@ class WalkService(QObject):
             elif isinstance(value, str) and value:
                 bits.append(f"{label} {value}")
         return " · ".join(bits)
+
+    def _open_swap(self, rec: Any = None, _card: Any = None) -> None:
+        """照片卡「换素材」：选衣服 / 场景 / 道具，然后带这套重拍。"""
+        from PySide6.QtWidgets import QDialog
+
+        from .assets_picker import SwapAssetsDialog
+
+        try:
+            dialog = SwapAssetsDialog(self.store, rec or {})
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            chosen = dialog.chosen() if accepted else {}
+            if accepted:
+                self.take_selfie("swap", chosen)
+        except Exception:  # noqa: BLE001
+            log.exception("换素材失败")
 
     def _open_library(self) -> None:
         from . import runtime
