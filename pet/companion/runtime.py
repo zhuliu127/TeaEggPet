@@ -109,11 +109,26 @@ def _hook_chat_schedule() -> None:
         store = companion_store()
         if store is None:
             return ""
-        return schedule_mod.chat_context(store)
+        # 溜达状态排在日程前面：人在外面时，日程里「此刻在公司赶需求」是出门前的安排，
+        # 不是现在的事实。两段都喂，靠前的那段带更强的「以这段为事实」约束。
+        parts: list[str] = []
+        svc = _service
+        walk_ctx = ""
+        if svc is not None:
+            try:
+                walk_ctx = svc.chat_context()
+            except Exception:  # noqa: BLE001
+                log.debug("溜达状态取用失败", exc_info=True)
+        if walk_ctx:
+            parts.append(walk_ctx)
+        schedule_ctx = schedule_mod.chat_context(store)
+        if schedule_ctx:
+            parts.append(schedule_ctx)
+        return "\n\n".join(parts)
 
     try:
         chat_prompt.set_companion_context(provider)
-        log.info("日程已接入 AI 对话（问「在干什么」按当天日程回答）")
+        log.info("日程与溜达状态已接入 AI 对话（问「在干什么」按当天日程 / 是否在外面回答）")
     except Exception:  # noqa: BLE001
         log.exception("日程接入对话失败（对话仍可用）")
 
@@ -469,6 +484,45 @@ def move_host():
         if callable(getattr(sprite, "trigger_move", None)):
             return sprite
     return None
+
+
+def visibility_host():
+    """能把整只桌宠藏起来 / 放回来的宿主。
+
+    overlay 拓扑下是壳的 ``set_pet_visible``（整窗 + 岛状态 + 子系统 pause/resume
+    都收口在那一个方法里）；legacy 是 ``PetWindow.hide/show``。
+    """
+    for obj in _candidates():
+        if callable(getattr(obj, "set_pet_visible", None)):
+            return obj
+        if callable(getattr(obj, "hide", None)) and callable(getattr(obj, "show", None)):
+            return obj
+    return None
+
+
+def set_pet_visible(visible: bool) -> bool:
+    """藏 / 放回桌宠（出去溜达时「人不在电脑前」的视觉表达）。返回是否真的改到了。"""
+    host = visibility_host()
+    if host is None:
+        log.debug("没有可显隐的宿主，跳过（拓扑不支持）")
+        return False
+    try:
+        setter = getattr(host, "set_pet_visible", None)
+        if callable(setter):
+            setter(bool(visible))
+            return True
+        if visible:
+            host.show()
+            return True
+        hider = host.hide
+        try:
+            hider(notify=False)      # 内部显隐：不弹托盘提示、不 arm Dock 恢复
+        except TypeError:
+            hider()
+        return True
+    except Exception:  # noqa: BLE001
+        log.exception("切换桌宠显隐失败（visible=%s）", visible)
+        return False
 
 
 def bubble(text: str, ms: int = 6000) -> bool:

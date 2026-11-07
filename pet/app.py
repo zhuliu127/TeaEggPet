@@ -314,36 +314,59 @@ class _EmptyPetHost:
 
 
 class _UpdateBridge(_BackgroundResult):
-    def __init__(self, parent, owner=None):
+    """手动检查更新的结果回显。
+
+    ``quiet=True`` 是「启动时自动检查」用的：只在**确实有新版本**时冒一句，
+    是最新版本或者连不上就安静记日志，绝不打开设置窗——
+    启动自动检查的目的是提醒，不是把人从手头的事里拽出来。
+    """
+
+    def __init__(self, parent, owner=None, *, quiet: bool = False):
         super().__init__()
         self.parent = parent
         self.owner = owner
+        self.quiet = bool(quiet)
         self.done.connect(self._show)
 
     def _show(self, ok: bool, payload) -> None:
         # 异步回调可能晚于窗口销毁，先探活再触碰 Qt 对象
         alive = self.parent is not None and shiboken6.isValid(self.parent)
         if not ok:
+            if self.quiet:
+                logging.debug("启动自动检查更新失败：%s", payload)
+                return
             if alive:
                 self.parent.show_bubble(f"检查更新失败：{payload}", duration_ms=7000)
             return
         release = payload
         tag = str(release.get("version", ""))
         if not updater.is_newer(tag):
+            if self.quiet:
+                logging.info("启动自动检查：已是最新版本（%s）", updater.APP_VERSION)
+                return
             if alive:
                 self.parent.show_bubble(f"已经是最新版本（{updater.APP_VERSION}）啦")
             return
-        if alive:
+        if not alive:
+            return
+        if self.quiet:
+            # 自动检查不做「下载并安装」也不再跳设置页，只留一句能自己跟进的话
             self.parent.show_bubble(
-                f"发现新版本 v{tag}（当前 {updater.APP_VERSION}）。"
-                "正在打开“更新”页，可直接下载并安装。",
+                f"发现新版本 v{tag}（当前 {updater.APP_VERSION}），"
+                "右键 →「检查更新」可以查看说明或打开下载页。",
                 duration_ms=9000,
             )
-            owner = self.owner
-            instance = getattr(owner, "instance", None) if owner is not None else None
-            open_settings = getattr(instance, "open_modern_settings", None)
-            if callable(open_settings):
-                QTimer.singleShot(0, lambda: open_settings(initial_page="更新"))
+            return
+        self.parent.show_bubble(
+            f"发现新版本 v{tag}（当前 {updater.APP_VERSION}）。"
+            "正在打开“更新”页，可查看说明或打开下载页。",
+            duration_ms=9000,
+        )
+        owner = self.owner
+        instance = getattr(owner, "instance", None) if owner is not None else None
+        open_settings = getattr(instance, "open_modern_settings", None)
+        if callable(open_settings):
+            QTimer.singleShot(0, lambda: open_settings(initial_page="更新"))
 
 
 # 批5.2 §③.7：多窗日志用 [slot-N] 前缀区分。单进程多窗共享一份日志文件，
@@ -439,6 +462,9 @@ def _read_spawn_offset_env() -> int:
 
 # 播放器路径预热的错峰延迟：排在动画预热之后，避开多开启动期的 IO 洪峰。
 _MUSIC_PLAYER_WARM_DELAY_MS = 2500
+
+#: 启动后自动检查更新的延迟：错开首帧动画、语音预热（9s）与首轮日程加载。
+_AUTO_UPDATE_CHECK_DELAY_MS = 12000
 
 #: 归「手动视觉 vision」模块的全局快捷键动作（注册与回调双守的共用清单）。
 #: ``hotkey_open_chat`` 不在此列：chat 的闸在 enable_chat 单源上。
@@ -1403,6 +1429,9 @@ class AppShell:
         self._balance_timer = QTimer()
         self._balance_timer.timeout.connect(self.show_balance)
         self._update_bridge = None
+        # 更新检查的重入防护 + 「本次启动已自动检查过」标记（启动自动检查只做一次）
+        self._update_checking = False
+        self._update_auto_checked = False
         self._balance_cache_path = config.dir / 'balance_cache.json'  # 跨实例共享余额缓存（按 provider 绑定）
         # 待办提醒：进程级单例（多窗共用一个调度器，避免每窗一个定时器重复通知），
         # Phase 1 门控：默认懒创建——配置关闭时不构造、不跑 30s 定时器；关闭且
@@ -2791,6 +2820,9 @@ class AppShell:
         # 启动时补一次：点击动画绑定对话框不走设置页保存信号，改动要等下次启动才被
         # 发现（合成一句约 20 秒，放晚一点，别和首帧/动画预热抢资源）。
         QTimer.singleShot(9000, self._precache_self_talk_voice_on_start)
+        # 启动静默检查一次更新：晚 12 秒，错开首帧动画与语音预热；
+        # 有新版才冒一句话，没新版/断网都不打扰。
+        QTimer.singleShot(_AUTO_UPDATE_CHECK_DELAY_MS, self._auto_check_update)
         # issue #111：会话结束（Windows 关机/注销）探测器。必须在窗口就绪后安装
         # ——它要在关机窗口期到来**之前**就位，才能抢在会话拆除前关掉 ffmpeg
         # 派生（否则系统会弹 0xc0000142 阻塞关机）。
@@ -4339,6 +4371,38 @@ class AppShell:
             pass
 
     # ------------------------------------------------------------ 更新
+    def _auto_check_update(self) -> None:
+        """启动后静默检查一次更新（每天开机第一次打开时提醒一次新版）。
+
+        静默口径：有新版才在头顶冒一句；已是最新版 / 连不上只写日志，不弹窗、
+        不开设置页。这里与 ``check_update`` 共用 ``_update_checking`` 防并发。
+        """
+        if self._update_auto_checked:
+            return
+        self._update_auto_checked = True
+        if self._update_checking:
+            logging.debug("启动自动检查更新跳过：已有检查在进行")
+            return
+        self._update_checking = True
+        target = self.instance.win if self.instance is not None else None
+        bridge = _UpdateBridge(target, owner=self, quiet=True)
+        self._update_bridge = bridge
+        bridge.done.connect(lambda *_: setattr(self, "_update_checking", False))
+
+        def worker() -> None:
+            try:
+                release = updater.latest_release()
+            except Exception as exc:  # noqa: BLE001
+                logging.debug("启动自动检查更新失败", exc_info=True)
+                bridge.done.emit(False, str(exc))
+                return
+            if not release:
+                bridge.done.emit(False, "无法连接更新服务")
+                return
+            bridge.done.emit(True, release)
+
+        threading.Thread(target=worker, daemon=True, name="pet-update-auto-check").start()
+
     def check_update(self, parent=None) -> None:
         # 重入防护（审查 GLM-L3）：连点不应起多个检查线程/叠气泡
         if getattr(self, "_update_checking", False):

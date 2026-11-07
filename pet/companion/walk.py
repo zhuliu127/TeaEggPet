@@ -29,6 +29,13 @@ log = logging.getLogger(__name__)
 MAX_NARRATION_CHARS = 120
 _SENTENCE_END = "。！？～…，"
 
+#: 出门奔跑动画的时长（毫秒）：跑完这一段才把桌宠藏起来。
+_EXIT_ANIM_MS = 1400
+#: 回家奔跑动画的时长：先回到桌面、跑一段，再说「我回来啦」。
+_ENTER_ANIM_MS = 1200
+#: 挑「奔跑感」素材的名字线索（角色包里有一条「左转奔跑」）。
+_RUN_HINTS = ("奔跑", "跑", "run", "dash", "冲刺", "冲")
+
 
 def _clip_sentence(text: str, limit: int = MAX_NARRATION_CHARS) -> str:
     """超长文案按标点收尾。
@@ -94,6 +101,10 @@ class WalkService(QObject):
         self._closed = False
         self._last_message = ""
         self._last_message_at: datetime | None = None
+        # 出门动画/隐藏的时序令牌：连续 start→stop 时旧 singleShot 不能把新状态改回去
+        self._vis_token = 0
+        # 这轮溜达是否已经把桌宠藏起来了（回来要恢复，退出进程前也要恢复）
+        self._hidden = False
 
     # ---------------------------------------------------------------- 状态
     @property
@@ -137,6 +148,104 @@ class WalkService(QObject):
             return max(low, min(high, 10))
         return max(low, min(high, int(left)))
 
+    # ---------------------------------------------------------------- 显隐与动画
+    def _bump_vis_token(self) -> int:
+        self._vis_token += 1
+        return self._vis_token
+
+    def _clip_names(self) -> list[str]:
+        """当前宿主可播放的动画名（legacy 的窗直接有 moves；overlay 走 sprite 库）。"""
+        from . import runtime
+
+        host = runtime.move_host()
+        if host is None:
+            return []
+        moves = getattr(host, "moves", None)
+        if moves:
+            return [str(n) for n in moves]
+        sprite = getattr(host, "sprite", None)
+        lib = getattr(sprite, "library", None) or getattr(host, "library", None)
+        names = getattr(lib, "names", None)
+        if callable(names):
+            try:
+                names = names()
+            except Exception:  # noqa: BLE001
+                names = None
+        return [str(n) for n in (names or [])]
+
+    def _run_clip_name(self) -> str:
+        """挑一条「跑」的素材；找不到跑的就退回任意移动素材。"""
+        names = self._clip_names()
+        for name in names:
+            low = name.lower()
+            if any(h in name or h in low for h in _RUN_HINTS):
+                return name
+        return names[0] if names else ""
+
+    def _play_run(self) -> None:
+        """播放一段奔跑动画（只做画面，不抢窗口位置）。"""
+        from . import runtime
+
+        name = self._run_clip_name()
+        host = runtime.move_host()
+        if host is None:
+            return
+        switch = getattr(host, "switch_clip", None)
+        if name and callable(switch):
+            try:
+                switch(name)
+                return
+            except Exception:  # noqa: BLE001
+                log.debug("播放奔跑动画失败", exc_info=True)
+        nudge = getattr(host, "trigger_move", None)
+        if name and callable(nudge):
+            try:
+                nudge(name)
+            except Exception:  # noqa: BLE001
+                log.debug("触发移动（代替奔跑动画）失败", exc_info=True)
+
+    def _hide_pet(self, token: int) -> None:
+        """跑完出门动画后把桌宠藏起来——就当真的出门了。"""
+        if token != self._vis_token or not self.walking:
+            return
+        from . import runtime
+
+        if runtime.set_pet_visible(False):
+            self._hidden = True
+            log.info("溜达开始：奔跑动画播完，桌宠已隐藏")
+
+    def _show_pet(self) -> None:
+        """回到桌面（本来没藏就什么都不做）。"""
+        if not self._hidden:
+            return
+        from . import runtime
+
+        if runtime.set_pet_visible(True):
+            self._hidden = False
+            log.info("溜达结束：桌宠回到桌面")
+
+    def chat_context(self) -> str:
+        """给 AI 对话的一段事实：她此刻在外面溜达，不在电脑前。
+
+        没在溜达返回空串（调用方据此不注入，提示词与不带溜达时逐字节一致）。
+        """
+        if not self.walking:
+            return ""
+        left = self.minutes_left
+        tail = f"大约 {left} 分钟后回家。" if left else "快回家了。"
+        hint = str(self._hint or "").strip()
+        head = "【此刻状态】你现在正在外面溜达，人不在电脑前，也不在桌面上。"
+        head += tail
+        if hint:
+            head += f"这趟出来的由头：{hint}。"
+        return "\n".join([
+            head,
+            "用户问你在做什么、在哪、忙不忙、吃了没、什么时候回来这类问题时，"
+            "以「在外面溜达」为事实，用第一人称口语回答：可以说路上看到的、天气、心情、顺手买了什么；"
+            "不要说自己坐在桌面上、一直在陪聊天，也不要按日程里此刻的活动回答"
+            "（那是出门前的安排，只有用户明确问日程时才可以提）。",
+        ])
+
     # ---------------------------------------------------------------- 开始
     def start(self, hint: str = "") -> dict[str, Any]:
         if self.walking:
@@ -151,8 +260,10 @@ class WalkService(QObject):
         opening = f"我出门啦～大概 {minutes} 分钟后回来"
         self._say(opening, sticky_ms=9000)
         self._notify(name, opening)
-        self._walk_timer.start(6000)
-        QTimer.singleShot(800, self._nudge_walk)
+        # 出门：先跑一段给她看，跑完就藏起来（像真的走出去了）
+        self._play_run()
+        token = self._bump_vis_token()
+        QTimer.singleShot(_EXIT_ANIM_MS, lambda: self._hide_pet(token))
         QTimer.singleShot(5000, lambda: self._narrate("start"))
         self._schedule_message()
         self._end_timer.start(minutes * 60000)
@@ -171,16 +282,25 @@ class WalkService(QObject):
         self._end_timer.stop()
         self._walk_timer.stop()
         self.changed.emit()
+        token = self._bump_vis_token()
+        # 回家：先回到桌面，再跑一段进来，站稳了才说话（不然气泡跟着动画乱飘）
+        self._show_pet()
+        QTimer.singleShot(60, self._play_run)
+        QTimer.singleShot(_ENTER_ANIM_MS, lambda: self._on_back_home(token, reason))
+        log.info("结束溜达（%s），本轮 %s 分钟", reason, minutes)
+        return {"ok": True, "minutes": minutes}
+
+    def _on_back_home(self, token: int, reason: str) -> None:
+        """回家奔跑动画播完后的收尾：招呼一句 + 按设置自拍。"""
+        if token != self._vis_token or self.walking:
+            return
         name = self._pet_name()
         self._say("我回来啦～", sticky_ms=9000)
         self._notify(name, "溜达一圈回来啦，准备给你拍张照～")
         if bool(self.store.get("companion_walk_auto_selfie", True)):
-            # 先让「我回来啦」在气泡和通知里留一会儿，再去拍照
-            QTimer.singleShot(2600, lambda: self._take_selfie(reason))
+            QTimer.singleShot(1400, lambda: self._take_selfie(reason))
         else:
             self._notify("我回来了", "溜达一圈，回来啦。")
-        log.info("结束溜达（%s），本轮 %s 分钟", reason, minutes)
-        return {"ok": True, "minutes": minutes}
 
     def toggle(self) -> dict[str, Any]:
         return self.stop("hotkey") if self.walking else self.start()
@@ -223,6 +343,8 @@ class WalkService(QObject):
         """让她真的走两步：复用宿主自己的移动动画与可达性判定。"""
         from . import runtime
 
+        if self._hidden:      # 人在外面，桌面上没有她，别再驱动走动
+            return
         host = runtime.move_host() or self._window()
         if host is None:
             return
@@ -466,6 +588,8 @@ class WalkService(QObject):
     # ---------------------------------------------------------------- 退场
     def shutdown(self) -> None:
         self._closed = True
+        self._vis_token += 1
+        self._show_pet()
         self._msg_timer.stop()
         self._end_timer.stop()
         self._walk_timer.stop()

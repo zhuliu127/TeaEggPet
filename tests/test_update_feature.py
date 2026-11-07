@@ -27,7 +27,9 @@ def test_settings_has_version_footer_and_update_page(tmp_path, monkeypatch):
         assert dialog.version_footer.objectName() == "settingsVersion"
         assert dialog.version_footer.text().startswith("版本 v")
         assert dialog.update_page.findChild(settings_mod.QPushButton, "checkUpdateButton") is not None
-        assert dialog.update_page.findChild(settings_mod.QPushButton, "installUpdateButton") is not None
+        # 「下载并安装」已撤掉：绿色包不是 Inno Setup 安装器，auto-install 永远选不到资产
+        assert dialog.update_page.findChild(settings_mod.QPushButton, "installUpdateButton") is None
+        assert dialog.update_page.findChild(settings_mod.QPushButton, "manualUpdateButton") is not None
         assert dialog.select_page("更新") is True
         assert dialog.sidebar.currentItem().text() == "更新"
     finally:
@@ -56,7 +58,7 @@ def test_settings_update_page_does_not_write_config(tmp_path, monkeypatch):
         "html_url": "https://github.com/zhuliu127/TeaEggPet/releases",
     }
     page._on_check_finished(release)
-    assert page.status_label.text().startswith(f"发现 v{newer}")
+    assert page.status_label.text().startswith(f"发现新版本 v{newer}")
     after = config.path.read_bytes() if config.path.exists() else None
     assert after == before
     page.close()
