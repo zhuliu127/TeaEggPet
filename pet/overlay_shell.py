@@ -4480,6 +4480,12 @@ class OverlayShell(QObject):
         # 会话里开窗/冒泡会被 AppKit 抑制，见 shared.run_after_menu_closed）。
         add_tray_action(menu, "桌宠设置",
                         lambda: self.open_settings_for(self.sprite))
+        # 陪伴扩展（出去溜达 / 叫她回家 / 自拍 / 素材库 / 陪伴设置）：
+        # overlay 拓扑下用户看到的就是**这个**托盘（AppShell._build_tray 那份在
+        # overlay 下不安装），所以必须在这里也挂一份——她出去溜达时整窗隐藏，
+        # 桌面上没得点，托盘又没有这条，就等于叫不回来（用户实测 1.4.8）。
+        walk_action = self._add_companion_tray_menu(menu)
+        menu.aboutToShow.connect(lambda: self._sync_companion_tray(walk_action))
         # legacy 托盘两项（app.py:3333-3343）：鼠标穿透的取消入口只有托盘/设置页，
         # 开着时桌宠点不动；开机自启此前只有右键菜单有勾选项。两项都写配置、写系统
         # 登录项，按派发契约走勾选版助手。
@@ -4558,6 +4564,82 @@ class OverlayShell(QObject):
             label = f"小肥鱼 [slot-{slot}]" if slot is not None else "小肥鱼"
             entries.append((sprite, label))
         return entries
+
+    # ------------------------------------------------------------ 托盘 · 陪伴扩展
+    @staticmethod
+    def _companion_service():
+        """进程级 WalkService（只读，不触发 attach；没挂上返回 None）。"""
+        try:
+            from .companion import runtime as companion_runtime
+
+            return companion_runtime.current_service()
+        except Exception:  # noqa: BLE001
+            logging.debug("overlay: 取陪伴扩展服务失败", exc_info=True)
+            return None
+
+    def _companion_walk_label(self) -> str:
+        svc = self._companion_service()
+        if svc is not None and getattr(svc, "walking", False):
+            return f"叫她回家（还有 {svc.minutes_left} 分钟）"
+        return "出去溜达（回来发自拍）"
+
+    def _add_companion_tray_menu(self, menu: QMenu):
+        """托盘「陪伴扩展」子菜单；返回溜达那一条（文案要随状态刷新）。"""
+        sub = menu.addMenu("陪伴扩展")
+        walk = add_tray_action(sub, self._companion_walk_label(), self._tray_toggle_walk)
+        self._companion_walk_action = walk   # 切换溜达后刷新文案用（菜单不重建）
+        add_tray_action(sub, "发一张自拍（按此刻的日程）", self._tray_take_selfie)
+        add_tray_action(sub, "素材库与关键词…", self._tray_open_library)
+        add_tray_action(sub, "陪伴扩展设置…", self._tray_open_companion_settings)
+        return walk
+
+    def _sync_companion_tray(self, walk_action) -> None:
+        """弹出前刷新：溜达条目文案 + 托盘提示里的剩余时间。"""
+        try:
+            target = walk_action if walk_action is not None else getattr(
+                self, "_companion_walk_action", None)
+            if target is not None:
+                target.setText(self._companion_walk_label())
+            svc = self._companion_service()
+            if svc is not None and getattr(svc, "walking", False):
+                self.tray.setToolTip(f"TeaEggPet · 她在外面溜达，约 {svc.minutes_left} 分钟后回来")
+            else:
+                self.tray.setToolTip("TeaEggPet · 桌面宠物")
+        except Exception:  # noqa: BLE001
+            logging.debug("overlay: 刷新陪伴扩展托盘项失败", exc_info=True)
+
+    def _tray_toggle_walk(self) -> None:
+        svc = self._companion_service()
+        if svc is None:
+            self.show_bubble("陪伴扩展还没启动好，稍等一下再点～", duration_ms=5000)
+            return
+        result = svc.toggle()
+        if isinstance(result, dict) and not result.get("ok", True):
+            self.show_bubble(str(result.get("error") or "现在不方便出去"), duration_ms=5000)
+        self._sync_companion_tray(None)
+
+    def _tray_take_selfie(self) -> None:
+        svc = self._companion_service()
+        if svc is None:
+            self.show_bubble("陪伴扩展还没启动好，稍等一下再点～", duration_ms=5000)
+            return
+        svc.take_selfie("manual")
+
+    def _tray_open_library(self) -> None:
+        try:
+            from .companion import runtime as companion_runtime
+
+            companion_runtime.open_library()
+        except Exception:  # noqa: BLE001
+            logging.exception("overlay: 托盘打开素材库失败")
+
+    def _tray_open_companion_settings(self) -> None:
+        try:
+            from .companion import runtime as companion_runtime
+
+            companion_runtime.open_settings()
+        except Exception:  # noqa: BLE001
+            logging.exception("overlay: 托盘打开陪伴扩展设置失败")
 
     def _exit_pet_from_tray(self, sprite) -> None:
         """菜单关闭后按捕获sprite走同一可逆关闭契约；过期目标为空操作。"""

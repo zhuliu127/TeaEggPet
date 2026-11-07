@@ -624,6 +624,58 @@ def parse_schedule(text: str) -> dict[str, Any]:
     }
 
 
+#: 生成日程的预算阶梯（字节数按 token 计）。推理模型会把预算烧在思维链上，
+#: 4000 常常只够吐半句 JSON —— 这就是用户看到的「模型没有返回 JSON」。
+_SCHEDULE_BUDGETS = (8000, 12000, 16000)
+#: 解析失败后的追加提示：只说格式，不重复内容要求。
+_RETRY_NUDGE = "\n\n【重来一次】上一次的输出不是合法 JSON（可能是被截断或夹了解释）。这次只输出 JSON 对象本身，" \
+               "不要任何解释、不要代码块标记；日程 12–16 段，每段 detail 一句话，务必把 JSON 写完整。"
+
+
+def _ask_day(store, prompt: str) -> tuple[dict[str, Any], str]:
+    """按预算阶梯请模型生成日程，失败就加预算/换提示再来一次。
+
+    返回 ``(parsed, 原始文本)``；三次都失败时抛最后一个错误。
+    """
+    last_error = ""
+    for index, budget in enumerate(_SCHEDULE_BUDGETS):
+        content = prompt if index == 0 else prompt + _RETRY_NUDGE
+        # 第一次顺带试 response_format=json_object（支持的网关能直接掐掉解释文字）；
+        # 网关不认它会报错，那一档就退回普通模式再试一次。
+        for json_mode in ((True, False) if index == 0 else (False,)):
+            try:
+                text, info = llm.ask_with_info(
+                    store.cfg,
+                    [{"role": "user", "content": content}],
+                    max_tokens=budget,
+                    temperature=0.95 if index == 0 else 0.8,
+                    timeout=240,
+                    json_mode=json_mode,
+                )
+            except llm.CompanionLLMError as exc:
+                last_error = str(exc)
+                log.warning("生成日程失败（budget=%s, json_mode=%s）：%s", budget, json_mode, exc)
+                continue
+            if not str(text or "").strip():
+                last_error = (
+                    "模型返回了空内容"
+                    + (f"（finish_reason={info.get('finish_reason')}）" if info.get("finish_reason") else "")
+                )
+                log.warning("生成日程：模型返回空内容（finish_reason=%s, usage=%s）",
+                            info.get("finish_reason"), info.get("usage"))
+                break          # 空内容 → 直接进下一档预算
+            if info.get("truncated"):
+                log.warning("生成日程被截断（finish_reason=%s, budget=%s），先尝试从完整段落里救",
+                            info.get("finish_reason"), budget)
+            try:
+                return parse_schedule(text), text
+            except llm.CompanionLLMError as exc:
+                last_error = str(exc)
+                log.warning("生成日程解析失败（budget=%s, json_mode=%s）：%s｜原文前 200 字：%s",
+                            budget, json_mode, exc, str(text)[:200])
+    raise llm.CompanionLLMError(last_error or "模型没有返回内容")
+
+
 def generate_day(store, key: str | None = None, hint: str = "", fallback: bool = True,
                  day_types: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     key = key or date_key()
@@ -636,14 +688,7 @@ def generate_day(store, key: str | None = None, hint: str = "", fallback: bool =
         "generatedAt": datetime.now().isoformat(timespec="seconds"),
     }
     try:
-        text = llm.ask(
-            store.cfg,
-            [{"role": "user", "content": build_prompt(store, key, day_type, hint)}],
-            max_tokens=4000,
-            temperature=0.95,
-            timeout=180,
-        )
-        parsed = parse_schedule(text)
+        parsed, _text = _ask_day(store, build_prompt(store, key, day_type, hint))
         day = {**base, **parsed, "items": link_items(parsed["items"], store, fill=True),
                "source": "llm", "model": ""}
     except Exception as exc:  # noqa: BLE001
