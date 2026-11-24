@@ -7,12 +7,42 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
 from . import library, presets as presets_mod
 
 CAT_LABEL = library.CATEGORY_LABEL
+
+#: 「自拍手臂入镜」关掉后，这些写法一律不许留在提示词里。
+#: 大模型写画面时特别爱自己补「举着手机」，光在指令里说不要并不够——必须在
+#: 出场前按句过滤，否则云端（不带千问重写）会直接把它送进生图接口。
+_PHONE_WORDS = (
+    "举着手机", "举起手机", "举高手机", "手机自拍", "手机镜头", "手机屏幕",
+    "手机挡", "手机在画面", "伸向镜头", "举向镜头", "对着手机", "自拍杆",
+    "拿着手机", "握着手机", "捧着手机", "手机对着", "手机举",
+)
+_CLAUSE_SPLIT = re.compile(r"(?<=[，,。；;、！!？?\n])")
+
+
+def strip_phone_wording(text: Any) -> str:
+    """去掉「举着手机 / 手机自拍」这类自拍描写，返回只剩画面的句子。
+
+    只在「自拍手臂入镜」关闭时调用：整句含手机动作就丢掉这一句，
+    剩下的「自拍」改成「照片」。全被丢光时给一句最普通的近景。
+    """
+    value = _one_line(text)
+    if not value:
+        return ""
+    kept = [part for part in _CLAUSE_SPLIT.split(value)
+            if part and not any(word in part for word in _PHONE_WORDS)]
+    out = "".join(kept).strip(" ，,、;；")
+    out = out.replace("自拍照", "照片").replace("自拍", "照片")
+    out = " ".join(out.split())
+    if not out:
+        return "她对着镜头拍了一张照片"
+    return out
 
 
 def _as_list(value: Any) -> list[str]:
@@ -52,7 +82,13 @@ def compose(args: dict[str, Any], store, lib=None, presets=None, now=None) -> di
     presets = presets if presets is not None else presets_mod.load(store)
     notes: list[str] = []
     unresolved: list[str] = []
+    arm_on = bool(store.get("companion_qwen_selfie_arm", False))
     prompt = str(args.get("prompt") or "").strip()
+    if prompt and not arm_on:
+        cleaned = strip_phone_wording(prompt)
+        if cleaned != prompt:
+            notes.append("画面里的「举着手机」已按设置去掉（自拍手臂入镜＝关）")
+        prompt = cleaned
 
     situation = _keyword("situation", args.get("situation"), presets)
     sit = None
@@ -66,6 +102,16 @@ def compose(args: dict[str, Any], store, lib=None, presets=None, now=None) -> di
             kw[group] = found
     if "light" not in kw and sit and sit.get("light"):
         kw["light"] = _keyword("light", sit["light"], presets)
+
+    # 「自拍手臂入镜」关（默认）时：不管是模型填了「自拍」、填了库外的「照片」，
+    # 还是一句都没填，一律换成普通拍一张照片的取景——提示词里不出现「举起手机」。
+    if not arm_on:
+        shot = kw.get("shot")
+        selfie_like = shot and (shot.get("name") in (presets_mod.ARM_SHOT_NAME,
+                                                     presets_mod.PLAIN_SHOT_NAME))
+        if not shot or not shot.get("preset") or selfie_like:
+            kw["shot"] = {"name": presets_mod.PLAIN_SHOT_NAME,
+                          "text": presets_mod.PLAIN_SHOT_TEXT, "preset": True}
 
     def pick_many(category: str, refs) -> list[dict[str, Any]]:
         out = []

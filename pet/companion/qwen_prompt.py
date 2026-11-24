@@ -103,11 +103,11 @@ def _brief(text: Any, limit: int) -> str:
 
 
 SELFIE_NO_ARM = (
-    "这是一张她自己发给我的自拍：她把手机举在画面之外、人凑近镜头。\n"
+    "这是一张她自己发给我的近景照片：她对着镜头、人凑近镜头。\n"
     "   · 近景半身：头到腰（或盘着的腿）在画面里，人物占画面 70% 以上；\n"
     "   · 头顶贴近画面上缘，脸在画面中上部，五官完整清晰、不被裁切；\n"
-    "   · 画面里**完全不出现**举手机的那只手臂——不画前臂、不画手、也不要在角落里"
-    "塞一段胳膊或袖口；就是她对着镜头，镜头外的事看不见。\n"
+    "   · 画面里**没有**任何手臂从画面外伸进来——不画前臂、不画手、也不要在角落里"
+    "塞一段胳膊或袖口；镜头就是自然地对着她，画面外的事看不见。\n"
     "   · 她自己的两只手照常出现在该在的地方（抱着抱枕、放在腿上、握手柄都行）。"
 )
 
@@ -149,7 +149,7 @@ def build_user_message(*, refs: list[dict[str, Any]], item: dict[str, Any], plan
 
     story = [
         f"她此刻的生活：{scene_line}" if scene_line else "她就在家里随手拍一张。",
-        f"这张照片的内容：{plan.get('prompt') or '她举起手机自拍一张'}",
+        f"这张照片的内容：{plan.get('prompt') or '她对着镜头拍了一张'}",
     ]
     camera = []
     for key, label in (("shot", "取景"), ("pose", "姿势"), ("expression", "表情"), ("light", "光线")):
@@ -164,13 +164,20 @@ def build_user_message(*, refs: list[dict[str, Any]], item: dict[str, Any], plan
     bits.append("这次要生成：\n" + "\n".join(f"- {x}" for x in story))
 
     style = str(store_style or DEFAULT_STYLE).strip()
+    fit_rule = (
+        "1.15 构图＝近景半身自拍：人物占画面 70% 以上、镜头离她近；头顶靠近画面上缘，脸在中上部。"
+        "举起手机的那只手臂只从画面一个角落斜切进来，长度不超过画面高度的四分之一，"
+        "严禁超长手臂或把整条胳膊拉进画面。\n"
+        if arm_visible else
+        "1.15 构图＝近景半身照片：人物占画面 70% 以上、镜头离她近；头顶靠近画面上缘，脸在中上部。"
+        "画面里不出现从画面外伸进来的手臂（前臂、手、袖口都不要出现在画面前景），也不要画出手机，"
+        "严禁超长手臂或把整条胳膊拉进画面。\n"
+    )
     bits.append(
         "写 rewritten_prompt 时的硬要求：\n"
         "1. 每张参考图用 <imageN> 点名职责，写清「取它的什么、不要它的什么」。\n"
-        "1.15 构图＝近景半身自拍：人物占画面 70% 以上、镜头离她近；头顶靠近画面上缘，脸在中上部。"
-        "画面里不出现伸向镜头的手臂（前臂、手、袖口都不要出现在画面前景），"
-        "严禁超长手臂或把整条胳膊拉进画面。\n"
-        "1.16 镜头距离与人物大小参考 <image1>（它本身就是近景自拍），不要把她画远。\n"
+        + fit_rule +
+        "1.16 镜头距离与人物大小参考 <image1>（它本身就是近景），不要把她画远。\n"
         "1.1 画风只跟 <image1>：它既是人物长相的唯一来源，也是线条/上色/光影/完成度的基准；"
         "其余参考图只用来**替换**服装、场景、道具，不要把它们的画风、模特、构图带进来。\n"
         "2. 服饰要拆成具体单品逐个写出来（例如「白色水手领衬衫、红色领结、米色粗针织开衫、"
@@ -184,6 +191,26 @@ def build_user_message(*, refs: list[dict[str, Any]], item: dict[str, Any], plan
 
 def _one_line(text: Any) -> str:
     return " ".join(str(text or "").replace("\r", " ").replace("\n", " ").split())
+
+
+def _strip_phone(text: Any) -> str:
+    """复用 compose 的过滤规则（惰性导入，免得两个模块互相 import）。"""
+    from .compose import strip_phone_wording
+
+    return strip_phone_wording(text)
+
+
+def _plain_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    """开关关着时的计划：画面和取景都换成普通照片，再交给模板重写。"""
+    if not isinstance(plan, dict):
+        return plan
+    from . import presets as presets_mod
+
+    out = dict(plan)
+    out["prompt"] = _strip_phone(out.get("prompt"))
+    if str(out.get("shot") or "").strip() in ("", "自拍", "自拍照", "手机自拍"):
+        out["shot"] = presets_mod.PLAIN_SHOT_NAME
+    return out
 
 
 def _style_present(prompt: str, style: str) -> bool:
@@ -209,6 +236,8 @@ def enhance(store, *, refs: list[dict[str, Any]], item: dict[str, Any], plan: di
     if not system:
         raise llm.CompanionLLMError("提示词模板为空")
     style = str(store.get("companion_qwen_style", "") or "").strip() or DEFAULT_STYLE
+    if not arm_visible:
+        plan = _plain_plan(plan)
     message = build_user_message(refs=refs, item=item, plan=plan, aspect=aspect, weekday=weekday,
                                  store_style=style, arm_visible=arm_visible)
     text = llm.ask(
@@ -225,6 +254,12 @@ def enhance(store, *, refs: list[dict[str, Any]], item: dict[str, Any], plan: di
     prompt = _one_line(data.get("rewritten_prompt"))
     if not prompt:
         raise llm.CompanionLLMError("rewritten_prompt 是空的")
+    if not arm_visible:
+        # 最后一公里：模板写了「不要手机」也挡不住模型自己加，出场前再洗一遍。
+        cleaned = _strip_phone(prompt)
+        if cleaned != prompt:
+            log.info("重写后的提示词里还有举手机的自拍描写，已按设置去掉")
+            prompt = cleaned
     # 兜底：模型偷懒没写风格时补上（本地模型对「二次元 / 日系插画」这类词很敏感，
     # 缺了就往半写实跑）。
     if not _style_present(prompt, style):

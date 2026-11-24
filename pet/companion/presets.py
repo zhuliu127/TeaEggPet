@@ -25,6 +25,15 @@ def _p(name, aliases, prompt, **extra):
     return item
 
 
+#: 「自拍手臂入镜」关闭（默认）时用的镜头写法：只是普通拍一张照片，
+#: 不提手机、不出现举起来的手臂。开关打开时才会用「自拍」那条举手机的取景。
+PLAIN_SHOT_NAME = "随手拍"
+PLAIN_SHOT_TEXT = (
+    "对着镜头随手拍的一张近景照片：人物占画面大部分，脸离镜头较近，视线看向镜头，画面干净自然"
+)
+ARM_SHOT_NAME = "自拍"
+
+
 DEFAULT_PRESETS: dict[str, list[dict[str, Any]]] = {
     "situation": [
         {"name": "在家休息", "aliases": ["在家", "宅家", "休息", "放松", "居家"], "scene": "卧室", "outfit": "居家针织服",
@@ -78,6 +87,7 @@ DEFAULT_PRESETS: dict[str, list[dict[str, Any]]] = {
     ],
     "shot": [
         _p("自拍", ["自拍照"], "手机自拍视角：人物一只手臂伸向镜头举着手机（手机在画面外），轻微俯拍，脸离镜头较近"),
+        _p(PLAIN_SHOT_NAME, ["照片", "随拍", "拍一张"], PLAIN_SHOT_TEXT),
         _p("特写", ["大头"], "面部特写，聚焦表情和眼神"),
         _p("近景", ["胸像"], "胸口以上的近景，人物占画面大部分"),
         _p("半身", [], "腰部以上的半身构图"),

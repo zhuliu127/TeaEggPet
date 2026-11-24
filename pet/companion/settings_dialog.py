@@ -287,16 +287,23 @@ class CompanionSettingsDialog(QDialog):
         self.max_refs.setRange(0, 16)
         self.identity_only = QCheckBox("参考图只还原长相")
         self.follow_schedule = QCheckBox("跟着日程此刻的穿着")
+        # 这条只决定「拍出来像不像举着手机自拍」，云端 / 本地都要生效，
+        # 所以放在公共段，而不是本地 ComfyUI 那一段里。
+        self.selfie_arm = QCheckBox("自拍手臂入镜")
+        self.selfie_arm.setToolTip(
+            "关（推荐）：只是普通拍一张照片，提示词里不提手机、也不画举起来的手臂\n"
+            "开：保留「举起手机拍了一张」的自拍感，画面里会带一条伸向镜头的手臂")
         box = QHBoxLayout()
         box.addWidget(QLabel("参考图上限"))
         box.addWidget(self.max_refs)
         box.addWidget(self.identity_only)
         box.addWidget(self.follow_schedule)
+        box.addWidget(self.selfie_arm)
         box.addStretch(1)
         row("", "组合", self._wrap(box))
 
         self.test_prompt = _line()
-        self.test_prompt.setPlaceholderText("试生成：傍晚的便利店门口，她举着手机自拍")
+        self.test_prompt.setPlaceholderText("试生成：傍晚的便利店门口，她提着刚买的关东煮")
         self.test_btn = QPushButton("试生成")
         self.test_btn.clicked.connect(self._test_generate)
         row("", "试一下", self._wrap(_hbox(self.test_prompt, self.test_btn, stretch_at=0)))
@@ -404,16 +411,11 @@ class CompanionSettingsDialog(QDialog):
         self.qwen_enhance = QCheckBox("用千问编辑模板重写提示词（建议开）")
         self.qwen_enhance.setToolTip("用你配的大模型把「此刻在做什么」改写成 Qwen-Edit 认的编辑指令，"
                                      "并强制带上画风约束")
-        self.selfie_arm = QCheckBox("自拍手臂入镜")
-        self.selfie_arm.setToolTip(
-            "关（推荐）：近景半身，画面里不出现举手机的手臂，构图最稳\n"
-            "开：保留「手臂伸向镜头」的自拍感，但手臂容易被透视拉长")
         box = QHBoxLayout()
         box.addWidget(self.comfy_exact)
         box.addWidget(self.qwen_enhance)
-        box.addWidget(self.selfie_arm)
         box.addStretch(1)
-        row("local", "三个开关", self._wrap(box))
+        row("local", "本地开关", self._wrap(box))
 
         self.qwen_style = _area(height=48)
         self.qwen_style.setPlaceholderText(
@@ -611,7 +613,7 @@ class CompanionSettingsDialog(QDialog):
         self.tts_read_walk = QCheckBox("念出出去溜达时报的那几句")
         self.tts_read_walk.setToolTip(
             "出门、途中「我在外面散步，风挺大」、回家这几句念出来；\n"
-            "「举起手机拍一张…」这类过程提示和报错只出气泡不念")
+            "「拍一张照片…」这类过程提示和报错只出气泡不念")
         form.addRow("", self.tts_read_chat)
         form.addRow("", self.tts_read_proactive)
         form.addRow("", self.tts_read_screen)
@@ -1351,7 +1353,7 @@ class CompanionSettingsDialog(QDialog):
         QMessageBox.warning(self, "出错了", message)
 
     def _test_generate(self) -> None:
-        prompt = self.test_prompt.text().strip() or "傍晚的便利店门口，她举着手机自拍"
+        prompt = self.test_prompt.text().strip() or "傍晚的便利店门口，她提着刚买的关东煮，暖黄的灯牌在身后"
         self.store.apply({k: v for k, v in self._collect().items() if k.startswith("companion_image") or k in (
             "companion_style_prompt", "companion_max_refs", "companion_identity_only", "companion_follow_schedule")})
         key = self.image_key.text().strip()

@@ -517,7 +517,8 @@ class WalkService(QObject):
             return
         # 拍照的过程提示只出气泡不念：这类「正在生成…」念出来很吵，
         # 真正要念的是回来那句和照片文案
-        self._say("举起手机拍一张…", sticky_ms=8000, speak=False)
+        self._say("举起手机拍一张…" if bool(self.store.get("companion_qwen_selfie_arm", False))
+                  else "拍一张照片…", sticky_ms=8000, speak=False)
         worker = _SelfieWorker(self.store, self._hint,
                                "walk" if reason != "manual" else "manual", self,
                                overrides=overrides)

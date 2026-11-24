@@ -25,14 +25,27 @@ WALK_LINES = (
 PLAN_KEYS = ("caption", "monologue", "prompt", "situation", "expression", "pose", "shot", "light", "scene", "aspect")
 
 
+def _snap_phrase(store) -> str:
+    """这一刻是「举起手机自拍」还是「随手拍一张照片」。
+
+    由陪伴扩展里的「自拍手臂入镜」开关决定：关（默认）就是普通照片，
+    提示词里完全不出现举手机这回事。
+    """
+    if bool(store.get("companion_qwen_selfie_arm", False)):
+        return "随手举起手机拍了一张"
+    return "随手拍了一张照片"
+
+
 def _fallback_plan(store, ctx, reason: str) -> dict[str, Any]:
     item = (ctx or {}).get("item") or {}
     activity = item.get("activity") or "在外面散步"
     place = item.get("scene") or item.get("location") or "街上"
     detail = item.get("detail") or ""
     sleeping = "睡" in activity
+    arm = bool(store.get("companion_qwen_selfie_arm", False))
+    snap = _snap_phrase(store)
     if reason == "walk":
-        prompt = "她临时出门溜达，走在附近的街上，随手举起手机自拍，背景是街景和行人"
+        prompt = f"她临时出门溜达，走在附近的街上，{snap}，背景是街景和行人"
         caption = "出来走走，风很舒服～"
         situation = "外出"
     elif sleeping:
@@ -40,7 +53,7 @@ def _fallback_plan(store, ctx, reason: str) -> dict[str, Any]:
         caption = "还没完全醒过来…"
         situation = "刚睡醒"
     else:
-        prompt = f"{place}，{activity}" + (f"，{detail}" if detail else "") + "，随手举起手机拍了一张"
+        prompt = f"{place}，{activity}" + (f"，{detail}" if detail else "") + f"，{snap}"
         caption = "随手拍了一张～"
         situation = "外出" if any(k in activity for k in ("出门", "逛", "散步", "走")) else "在家休息"
     her = schedule.her_entry(library.scan_all(store), store)
@@ -51,7 +64,7 @@ def _fallback_plan(store, ctx, reason: str) -> dict[str, Any]:
         "situation": situation,
         "expression": "困倦" if sleeping and reason != "walk" else "微笑",
         "pose": "伸懒腰" if sleeping and reason != "walk" else "站着",
-        "shot": "自拍",
+        "shot": presets_mod.ARM_SHOT_NAME if arm else presets_mod.PLAIN_SHOT_NAME,
         "light": "",
         "characters": [her["name"]] if her else [],
         "outfits": [ctx["outfit"]] if ctx and ctx.get("outfit") else [],
@@ -68,8 +81,9 @@ def _plan_prompt(store, ctx, hint: str, reason: str) -> str:
     her = schedule.her_entry(lib, store)
     name = str(store.get("companion_character_name", "她") or "她")
     item = (ctx or {}).get("item")
+    arm = bool(store.get("companion_qwen_selfie_arm", False))
     lines = [
-        f"你在给桌宠「{name}」安排一张自拍：她{'刚出门溜达了一圈' if reason == 'walk' else '想给你发张照片'}。",
+        f"你在给桌宠「{name}」安排一张{'自拍' if arm else '照片'}：她{'刚出门溜达了一圈' if reason == 'walk' else '想给你发张照片'}。",
         f"她的性格设定：{schedule.persona_text(store)}",
         (f"她原本的安排：{item.get('start')}–{item.get('end')} {item.get('activity')}"
          f"（{item.get('scene') or item.get('location') or '家'}）" + (f"——{item.get('detail')}" if item.get("detail") else ""))
@@ -81,11 +95,18 @@ def _plan_prompt(store, ctx, hint: str, reason: str) -> str:
         if ctx and ctx.get("scene") else "",
         f"这次额外要求：{hint}" if hint else "",
         "【要做的事】",
-        "按她此刻在做什么，想一个自然的自拍画面，然后填下面的字段：",
-        "- prompt：这张照片里发生了什么（40–90 字）。具体到地点细节、手里拿着什么、和周围怎么互动、情绪重点。不要写「自拍」「镜头」这类词，那是 shot 的活。",
+        "按她此刻在做什么，想一个自然的画面，然后填下面的字段：",
+        f"- prompt：这张照片里发生了什么（40–90 字）。具体到地点细节、手里拿着什么、和周围怎么互动、情绪重点。不要写「自拍」「镜头」这类词，那是 shot 的活。",
         "- caption：她把这张照片发给你时配的一句话，口语，15 字以内，可以带「～」。",
         "- monologue：她回家时说的第一句话，15 字以内。",
-        "- shot 一般填「自拍」；其它字段从下面的关键词里挑名字，没有合适的就留空。",
+        (f"- shot 一般填「{presets_mod.ARM_SHOT_NAME}」；其它字段从下面的关键词里挑名字，没有合适的就留空。"
+         if arm else
+         "- shot 留空就行（这张是普通照片，不要填「自拍」）；其它字段从下面的关键词里挑名字，"
+         "没有合适的就留空。"),
+        ("- 这是她举起手机拍的一张自拍，画面可以带上手机和举起的手臂。"
+         if arm else
+         "- 这是她随手拍的一张普通照片，不是举着手机的自拍：prompt 里不要出现「举起手机」「举着手机」"
+         "「手机挡住脸」「手臂伸向镜头」这类内容，就当镜头自然地对着她。"),
         "- characters / outfits / scene / props 填参考素材库里的名字（留空会自动搭配）。",
         "【可用关键词】",
         presets_mod.keyword_text(presets),
@@ -95,8 +116,12 @@ def _plan_prompt(store, ctx, hint: str, reason: str) -> str:
         json.dumps({
             "caption": "风好大，头发都飞起来了～",
             "monologue": "我回来啦，给你看照片！",
-            "prompt": "傍晚的便利店门口，她一手提着刚买的关东煮，一手举着手机，暖黄的灯牌在身后",
-            "situation": "外出", "expression": "开心", "pose": "站着", "shot": "自拍", "light": "霓虹夜景",
+            "prompt": ("傍晚的便利店门口，她一手提着刚买的关东煮，一手举着手机，暖黄的灯牌在身后"
+                       if arm else
+                       "傍晚的便利店门口，她一手提着刚买的关东煮，抬头看向镜头，暖黄的灯牌在身后"),
+            "situation": "外出", "expression": "开心", "pose": "站着",
+            "shot": presets_mod.ARM_SHOT_NAME if arm else presets_mod.PLAIN_SHOT_NAME,
+            "light": "霓虹夜景",
             "characters": [her["name"]] if her else [], "outfits": [], "scene": "", "props": [],
             "aspect": str(store.get("companion_image_aspect", "3:4") or "3:4"),
         }, ensure_ascii=False),
@@ -127,6 +152,14 @@ def plan(store, ctx, hint: str = "", reason: str = "walk") -> dict[str, Any]:
         value = data.get(key)
         if isinstance(value, list) and value:
             merged[key] = [str(v).strip() for v in value if str(v).strip()][:4]
+    if not bool(store.get("companion_qwen_selfie_arm", False)):
+        # 开关关着：模型自己加的「举着手机」要在进管道前就清掉，
+        # 否则【画面】和后面千问那一层的「取景」都会把它带进去。
+        merged["prompt"] = compose_mod.strip_phone_wording(merged.get("prompt"))
+        if str(merged.get("shot") or "").strip() in ("", "自拍", "自拍照", "手机自拍"):
+            merged["shot"] = presets_mod.PLAIN_SHOT_NAME
+        for key in ("pose", "expression"):
+            merged[key] = compose_mod.strip_phone_wording(merged.get(key))
     merged["planned"] = True
     return merged
 
@@ -168,7 +201,7 @@ def generate(store, hint: str = "", reason: str = "walk",
         on_status("她在想拍什么…")
     planned = plan(store, ctx, hint, reason)
     if on_status:
-        on_status("举起手机…")
+        on_status("举起手机…" if bool(store.get("companion_qwen_selfie_arm", False)) else "拍一张…")
     # 日程 × 素材 联动：这一段原本在哪个场景、穿哪套、拿什么，模型没写就按日程补上
     item = (ctx or {}).get("item") or {}
     lib = library.scan_all(store)
