@@ -22,8 +22,26 @@ _PHONE_WORDS = (
     "举着手机", "举起手机", "举高手机", "手机自拍", "手机镜头", "手机屏幕",
     "手机挡", "手机在画面", "伸向镜头", "举向镜头", "对着手机", "自拍杆",
     "拿着手机", "握着手机", "捧着手机", "手机对着", "手机举",
+    # 云端编辑模型爱写的「自拍视角」变体，前几版词表漏掉这些，导致开关关了
+    # 云端照旧画出伸向镜头的手臂。这里补齐「手臂/手/手机 + 镜头」的各种写法。
+    "手机视角", "拿起手机", "掏出手机", "掏出手机拍照", "对着镜子拍", "对着后置镜头",
+    "手臂伸进画面", "手臂伸出", "手臂从画面", "一条手臂", "整条胳膊", "胳膊伸",
+    "手举手机", "举手机", "手机拍自己", "手机在手里", "举着镜头", "手伸向镜头",
+    "手臂伸向镜头", "伸进画面", "伸入画面", "从画面外伸进来", "自拍的角度",
+)
+#: 只删「手机 / 手臂伸向镜头」这类动作短语，不必整句删（保留同一句里的
+#: 背景、穿着、表情信息）——用于 traits 等「一句话里混着姿势与神态」的字段。
+_PHONE_PHRASE = re.compile(
+    r"[^，,。；;、！!？?\n]*(?:举着手机|举起手机|举高手机|拿着手机|握着手机|捧着手机|"
+    r"拿起手机|掏出手机|手机视角|手机自拍|自拍杆|手机镜头|手机屏幕|手机挡|手机对着|手机举|"
+    r"伸向镜头|举向镜头|手臂伸进画面|手臂伸出|手臂从画面|手臂伸向镜头|一条手臂|整条胳膊|"
+    r"胳膊伸|手举手机|举手机|手机拍自己|手机在手里|举着镜头|手伸向镜头|伸进画面|伸入画面|"
+    r"从画面外伸进来|对着镜子拍|对着后置镜头)[^，,。；;、！!？?\n]*[，,。；;、！!？?\n]?"
 )
 _CLAUSE_SPLIT = re.compile(r"(?<=[，,。；;、！!？?\n])")
+#: 整句基本只是在说「自拍」的短句（如「她在街上自拍」里「自拍」被删后剩个空壳），
+#: 用来判断要不要连这一句一起丢。这里只匹配「就一个自拍/自拍照」的孤立从句。
+_ONLY_SELFIE_WORD = re.compile(r"^[，,。；;、！!？?\s]*(?:自拍|自拍照|手机自拍)[，,。；;、！!？?\s]*$")
 
 
 def strip_phone_wording(text: Any) -> str:
@@ -36,13 +54,33 @@ def strip_phone_wording(text: Any) -> str:
     if not value:
         return ""
     kept = [part for part in _CLAUSE_SPLIT.split(value)
-            if part and not any(word in part for word in _PHONE_WORDS)]
+            if part and not any(word in part for word in _PHONE_WORDS)
+            and not _ONLY_SELFIE_WORD.search(part)]
     out = "".join(kept).strip(" ，,、;；")
-    out = out.replace("自拍照", "照片").replace("自拍", "照片")
-    out = " ".join(out.split())
+    # 开关关着时「自拍」这个词本身就该消失——直接删掉，不要换成「照片」，
+    # 否则会留下「她在街上照片」这种读不通的残句。
+    out = out.replace("自拍照", "").replace("自拍", "")
+    out = " ".join(out.split()).strip(" ，,、;；")
     if not out:
         return "她对着镜头拍了一张照片"
     return out
+
+
+def strip_phone_phrases(text: Any) -> str:
+    """只删「举着手机 / 手伸向镜头 / 手臂伸进画面」这类动作短语，保留同句其余内容。
+
+    用于 ``traits`` 这种「一句话里混着性格神态与自拍姿势」的字段：
+    「自拍时会自然对着镜头笑、身体前倾，一只手伸向镜头（手机视角）」应当洗成
+    「自拍时会自然对着镜头笑、身体前倾」，而不是整句丢掉。开关关闭时使用。
+    """
+    value = _one_line(text)
+    if not value:
+        return ""
+    out = _PHONE_PHRASE.sub("", value)
+    # 只删手机/手臂动作短语，不把「自拍」硬换成「照片」——traits 里的
+    # 「自拍时会对着镜头笑」是性格描写，保留它无害，硬替换反而读起来别扭。
+    out = " ".join(out.split())
+    return out.strip(" ，,、;；。")
 
 
 def _as_list(value: Any) -> list[str]:
@@ -278,7 +316,17 @@ def compose(args: dict[str, Any], store, lib=None, presets=None, now=None) -> di
             parts.append(f"【{label}】{kw[group]['text']}")
     traits = [c for c in characters if (c.get("traits") or "").strip()]
     if traits:
-        parts.append("【人物神态特点】\n" + "\n".join(f"{c['name']}：{_one_line(c['traits'])}" for c in traits))
+        rows = []
+        for c in traits:
+            t = _one_line(c["traits"])
+            if not arm_on:
+                # traits 里常写着「一只手伸向镜头（手机视角）」，云端会当真照画，
+                # 开关关着就必须把这句里的手机姿势洗掉，只留性格神态。
+                t = strip_phone_phrases(t)
+            if t:
+                rows.append(f"{c['name']}：{t}")
+        if rows:
+            parts.append("【人物神态特点】\n" + "\n".join(rows))
     if text_only:
         parts.append("【搭配】" + "；".join(text_only))
 
@@ -314,6 +362,16 @@ def compose(args: dict[str, Any], store, lib=None, presets=None, now=None) -> di
             "重新安排，不要沿用任何一张参考图里的站姿、坐姿、表情或取景；两者冲突时以文字为准。"
             if loose else
             "要求：把以上参考融合成一张完整、自然的新画面，不要把参考图拼贴、并排或作为画中画放进画面；人物外貌必须与参考图一致。"
+        )
+
+    # 「自拍手臂入镜」关掉时，云端通道（不走千问重写）最容易犯的错：直接照抄
+    # 人物参考图本身那张「举着手机自拍」的姿势。这里在提示词最末尾补一段强约束，
+    # 明确点名「参考图里伸向镜头的手机和手臂不要带进来」，并把手机/手臂列为负向项。
+    if not arm_on:
+        parts.append(
+            "【重要·参考图姿势不要照搬】人物参考图里可能是举着手机自拍的动作。"
+            "这张图不是自拍：画面里不要出现手机、伸向镜头的手臂、自拍杆或任何从画面外伸进来的胳膊/手/袖口；"
+            "人物两只手照常出现在该在的位置（放在身侧、端杯子、拿道具都行），镜头自然地对着她。"
         )
 
     keywords: dict[str, str] = {}

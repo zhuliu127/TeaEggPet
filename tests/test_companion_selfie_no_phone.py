@@ -36,12 +36,24 @@ def test_strip_phone_wording_falls_back_when_all_phone():
     assert compose.strip_phone_wording("她举起手机对着镜头") == "她对着镜头拍了一张照片"
 
 
+#: arm-off 时会在末尾追加一段「参考图姿势不要照搬」的强约束，那段里会合法地
+#: 出现「手机」「举着手机」等字样（用来否定它们）。断言「画面里没有手机」时
+#: 需要先把这段警告剔掉，只检查真正的画面/镜头描述。
+_WARN_MARK = "【重要·参考图姿势不要照搬】"
+
+
+def _body(out: str) -> str:
+    idx = out.find(_WARN_MARK)
+    return out[:idx] if idx >= 0 else out
+
+
 def test_compose_plain_shot_and_clean_picture_when_arm_off(store):
     store.set("companion_qwen_selfie_arm", False)
     out = compose.compose({"prompt": "她一手举着手机自拍，背景是便利店",
                            "shot": "自拍"}, store)["final_prompt"]
-    assert "手机" not in out, out
+    assert "手机" not in _body(out), out
     assert presets.PLAIN_SHOT_TEXT in out
+    assert _WARN_MARK in out
 
 
 def test_compose_keeps_arm_when_switch_on(store):
@@ -82,3 +94,51 @@ def test_enhance_keeps_arm_when_enabled(store, monkeypatch):
     out = qwen_prompt.enhance(store, refs=[], item={}, plan={"prompt": "走在街上", "shot": "自拍"},
                               aspect="3:4", arm_visible=True)
     assert "举起手机" in out["rewritten_prompt"]
+
+
+# ---------------------------------------------------------------------------
+# 云端链路（不走千问重写，直接吃 compose.final_prompt + 原参考图）
+# ---------------------------------------------------------------------------
+
+def test_strip_phone_phrases_cleans_traits_but_keeps_personality():
+    raw = ("开心时会摇尾巴；害羞时会低头捏裙角；"
+           "自拍时会自然对着镜头笑、身体前倾，一只手伸向镜头（手机视角）")
+    out = compose.strip_phone_phrases(raw)
+    assert "手机" not in out and "伸向镜头" not in out, out
+    assert "摇尾巴" in out and "捏裙角" in out and "对着镜头笑" in out
+
+
+def test_strip_phone_wording_extra_variants():
+    for raw in (
+        "她拿起手机拍了一张",
+        "手机视角，近景",
+        "一条手臂从画面外伸进来",
+        "对着后置镜头自拍",
+    ):
+        out = compose.strip_phone_wording(raw)
+        assert "手机" not in out and "手臂" not in out and "镜头" not in out or out == "她对着镜头拍了一张照片", raw + " -> " + out
+
+
+def test_compose_cloud_final_prompt_has_no_phone_and_warns_pose(store):
+    """云端直接吃 final_prompt：关掉开关后，整段里不能有手机/手臂，
+    并且要带一句「参考图姿势不要照搬」的强约束。"""
+    store.set("companion_qwen_selfie_arm", False)
+    out = compose.compose({
+        "prompt": "她坐在工位前，一手举着手机自拍，另一手拿着咖啡",
+        "shot": "自拍",
+        "characters": ["小鱼"],
+    }, store)
+    fp = out["final_prompt"]
+    assert "举着手机" not in _body(fp) and "手机视角" not in _body(fp), fp
+    assert _WARN_MARK in fp, fp
+    assert presets.PLAIN_SHOT_TEXT in fp
+
+
+def test_compose_traits_phone_cleaned_in_final_prompt(store):
+    """人物 traits 里带「一只手伸向镜头（手机视角）」，关掉开关后 final_prompt
+    的【人物神态特点】里不许再出现手机/伸向镜头。"""
+    store.set("companion_qwen_selfie_arm", False)
+    out = compose.compose({"prompt": "她在街上走着", "characters": ["小鱼"]}, store)
+    fp = out["final_prompt"]
+    assert "手机视角" not in _body(fp), fp
+    assert "一只手伸向镜头" not in _body(fp), fp

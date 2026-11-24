@@ -75,7 +75,7 @@ def template_text(store) -> str:
     return ""
 
 
-def _describe_refs(refs: list[dict[str, Any]]) -> str:
+def _describe_refs(refs: list[dict[str, Any]], *, arm_visible: bool = False) -> str:
     lines = []
     for index, ref in enumerate(refs, start=1):
         category = str(ref.get("category") or "")
@@ -88,7 +88,16 @@ def _describe_refs(refs: list[dict[str, Any]]) -> str:
         if brief:
             label = "长相要点" if category == "characters" else ("服装要点" if category == "outfits" else "内容要点")
             line += f"，{label}：{brief}"
-        traits = _brief((ref.get("entry_data") or {}).get("traits"), 60) if category == "characters" else ""
+        traits = ""
+        if category == "characters":
+            raw_traits = (ref.get("entry_data") or {}).get("traits")
+            if not arm_visible:
+                # traits 里常带「一只手伸向镜头（手机视角）」这种自拍姿势描写，
+                # 开关关着时先洗掉，免得重写模型把它当动作写进画面。
+                from .compose import strip_phone_phrases
+
+                raw_traits = strip_phone_phrases(raw_traits)
+            traits = _brief(raw_traits, 60)
         if traits:
             line += f"；神态特点：{traits}"
         lines.append(line)
@@ -125,7 +134,7 @@ def build_user_message(*, refs: list[dict[str, Any]], item: dict[str, Any], plan
     """拼「这次要生成什么」。只描述事实，判断交给模板里的模型。"""
     bits: list[str] = []
     if refs:
-        bits.append("参考图（按顺序，编号必须写成 <imageN>）：\n" + _describe_refs(refs))
+        bits.append("参考图（按顺序，编号必须写成 <imageN>）：\n" + _describe_refs(refs, arm_visible=arm_visible))
     else:
         bits.append("参考图：没有（纯文生图）")
 
