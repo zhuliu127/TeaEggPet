@@ -97,6 +97,54 @@ def _looks_hallucinated(text: str) -> bool:
     return False
 
 
+# ASR 幻听/字幕套话过滤词表（参考 dsh-dafeiyu-pro 实战验证：ASR 听到背景音/视频时
+# 会输出字幕套话）。命中这些就当噪声丢弃，绝不能当用户说话。
+_HALLUCINATION_PHRASES = (
+    "谢谢观看", "感谢观看", "请订阅", "订阅", "点赞", "字幕", "出品", "独家",
+    "禁止转载", "未经允许", "网易云音乐", "qq音乐", "伴奏", "纯音乐",
+    "bilibili", "哔哩哔哩", "字幕由", "明镜与点点", "未经许可",
+)
+
+
+def _looks_like_subtitle_junk(text: str) -> bool:
+    """ASR 输出像字幕套话/背景音 → 丢弃。"""
+    t = _norm(text)
+    if not t:
+        return True
+    for phrase in _HALLUCINATION_PHRASES:
+        if _norm(phrase) and _norm(phrase) in t:
+            return True
+    return False
+
+
+def _zero_crossing_rate(x) -> float:
+    """过零率：单位采样内的符号翻转次数。参考实战数据，键击/碰撞/高频噪声的
+    过零率显著高于人声（>0.32 基本是噪声），是最有效的噪声过滤器。"""
+    import numpy as np
+
+    a = np.asarray(x, dtype=np.float32)
+    if a.shape[0] < 2:
+        return 0.0
+    signs = np.signbit(a)
+    return float(np.count_nonzero(signs[1:] != signs[:-1])) / float(a.shape[0] - 1)
+
+
+def _voiced_ratio(x, frame: int = 480) -> float:
+    """有声帧占比：按 30ms 帧算 RMS，超过相对阈值（全局均值的 0.6 倍）的帧比例。
+    人声通常在 0.4 以上，断续噪声低。"""
+    import numpy as np
+
+    a = np.asarray(x, dtype=np.float32)
+    n = a.shape[0]
+    if n < frame:
+        return 0.0
+    frames = n // frame
+    rms = np.array([float(np.sqrt(np.mean(a[i * frame:(i + 1) * frame] ** 2)) + 1e-9)
+                    for i in range(frames)])
+    thr = max(1e-4, float(np.mean(rms)) * 0.6)
+    return float(np.count_nonzero(rms >= thr)) / float(frames)
+
+
 
 class VoiceAssistantError(RuntimeError):
     pass
@@ -206,6 +254,9 @@ class VoiceAssistant(QObject):
     slept = Signal()                     # 退出对话
     heard = Signal(str)                  # 识别到的整句（调试/显示）
     error = Signal(str)
+    # 跨线程发声请求：采集后台线程 emit，GUI 线程槽执行（QMediaPlayer 只能主线程用）。
+    # 这比在后台线程里 QTimer.singleShot 更可靠——信号跨线程是 queued connection。
+    speak_requested = Signal(str)
 
     def __init__(self, app, parent=None) -> None:
         super().__init__(parent)
@@ -227,6 +278,11 @@ class VoiceAssistant(QObject):
         self._busy_deadline = 0.0  # 忙碌兜底超时（防回调没来）
         self._model_main_info = ""  # 当前对话模型说明（给设置页显示）
         self._model_kws_info = ""   # 当前唤醒模型说明（给设置页显示）
+        # 把发声请求接到真正的执行函数（GUI 线程里跑）
+        try:
+            self.speak_requested.connect(self._do_speak)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------ 配置读取
     def _store(self):
@@ -492,19 +548,23 @@ class VoiceAssistant(QObject):
         self.status.emit("语音助手已开启，说「%s」叫醒我～" % self._wake_word())
 
         vad_opts = VadOptions(
-            threshold=0.5,
-            min_speech_duration_ms=250,
-            min_silence_duration_ms=500,
-            speech_pad_ms=120,
+            threshold=0.45,
+            min_speech_duration_ms=180,
+            min_silence_duration_ms=380,
+            speech_pad_ms=140,
         )
         buffer = np.zeros(0, dtype=np.float32)
         silence_blocks = 0
         speaking = False
-        silence_limit = int(0.6 / (BLOCK_MS / 1000.0))  # 0.6 秒静音判定一句话结束
-        max_seg_sec = 8.0
+        # 静音断句阈值（块数）：待命态（参考 §8.4 用 ~0.7s，太短会把唤醒词尾巴切掉、
+        # 或"说到一半就不听了"），对话态 1.0s（给长句换气留空档）。BLOCK_MS=30ms。
+        silence_limit_idle = int(0.70 / (BLOCK_MS / 1000.0))     # 待命 ~0.7s
+        silence_limit_dialog = int(1.00 / (BLOCK_MS / 1000.0))   # 对话 ~1.0s
+        max_seg_sec = 18.0  # 单段上限放到 18s（参考实战：12s 说长句太紧）
 
-        # 自适应能量门限：先按一个较低初值，持续跟踪底噪（静音块 RMS 的滑窗分位）
-        energy_threshold = 0.004
+        # 自适应能量门限：先按一个较低初值，持续跟踪底噪（静音块 RMS 的滑窗分位）。
+        # 初值压低到 0.0035 更灵敏；上限 0.015 避免嘈杂环境把门限抬过头反而压掉人声。
+        energy_threshold = 0.0035
         noise_floor = 0.0
         last_level_log = 0.0
         # 采集采样率：很多 USB 麦克风/虚拟声卡不支持 16000Hz（强行给 16000 会
@@ -612,7 +672,7 @@ class VoiceAssistant(QObject):
                 # 自适应门限：把底噪推高到当前 RMS 的平滑值，门限 = 底噪 * 3 且不小于 0.003
                 if rms < energy_threshold:
                     noise_floor = 0.98 * noise_floor + 0.02 * rms
-                    energy_threshold = max(0.003, min(0.02, noise_floor * 3.0 + 0.002))
+                    energy_threshold = max(0.003, min(0.015, noise_floor * 3.0 + 0.002))
                 speech = rms > energy_threshold
 
                 # 每 3 秒打一条电平日志，方便排查「麦克风到底有没有信号」
@@ -639,7 +699,14 @@ class VoiceAssistant(QObject):
                         silence_blocks += 1
 
                 seg_too_long = buffer.shape[0] > int(max_seg_sec * SAMPLE_RATE)
-                seg_done = speaking and silence_blocks >= silence_limit
+                # 静音断句阈值随状态变化（参考 dsh-dafeiyu-pro 实战参数）：
+                # 对话态必须长一点（~1.0s），否则长句换气就被切断、"说到一半不听了"；
+                # 待命态短一点，唤醒词说完迅速出结果，响应更快。
+                if self._state == "idle":
+                    cur_silence_limit = silence_limit_idle
+                else:
+                    cur_silence_limit = silence_limit_dialog
+                seg_done = speaking and silence_blocks >= cur_silence_limit
                 if not (seg_done or seg_too_long):
                     continue
                 # 一段话结束：取出有语音的部分
@@ -667,8 +734,27 @@ class VoiceAssistant(QObject):
                     seg_rms = float(np.sqrt(np.mean(audio ** 2)) + 1e-9)
                     if seg_rms < 0.003:
                         continue
+                    # 过零率门控：键击/碰撞/高频噪声过零率明显高于人声（实战 >0.32 基本是噪声）。
+                    # 这是参考 dsh-dafeiyu-pro 验证过的最有效噪声过滤器（占噪声过滤 70%）。
+                    zcr = _zero_crossing_rate(audio)
+                    if zcr > 0.35:
+                        log.info("片段过零率过高(%.2f)，判为噪声丢弃", zcr)
+                        continue
+                    # 有声帧占比门控：人声通常 >0.4，断续噪声偏低
+                    voiced = _voiced_ratio(audio)
+                    if voiced < 0.30:
+                        log.info("片段有声帧占比过低(%.2f)，判为噪声丢弃", voiced)
+                        continue
                 except Exception:  # noqa: BLE001
                     pass
+                # 待命态「唤醒词长度窗口」（参考 dsh-dafeiyu-pro §8.6）：唤醒词典型 0.8~2s，
+                # 超过 ~3.5s 基本是旁人闲聊/电视，不是叫名字 → 丢弃不送识别。
+                # 既省算力、又避免长句被硬编成唤醒词造成误唤醒。
+                if self._state == "idle":
+                    seg_sec = audio.shape[0] / float(SAMPLE_RATE)
+                    if seg_sec > 3.5:
+                        log.info("待命片段过长(%.1fs)，超出唤醒词窗口，丢弃", seg_sec)
+                        continue
                 try:
                     self._handle_segment(audio)
                 except Exception:  # noqa: BLE001
@@ -719,6 +805,9 @@ class VoiceAssistant(QObject):
             if _looks_hallucinated(text):
                 log.info("待命片段疑似幻听，忽略：%r", text)
                 return
+            if _looks_like_subtitle_junk(text):
+                log.info("待命片段疑似字幕套话，忽略：%r", text)
+                return
             if _contains_any(text, [wake]) or self._fuzzy_wake(text):
                 self._enter_dialog()
             return
@@ -729,6 +818,10 @@ class VoiceAssistant(QObject):
                               vad_filter=True, beam_size=int(self._cfg("companion_whisper_beam", 1) or 1))
         self.heard.emit(text)
         if not text.strip():
+            return
+        # 字幕套话/背景音幻听：别当成用户说的话（会污染对话）
+        if _looks_like_subtitle_junk(text):
+            log.info("对话片段疑似字幕套话，忽略：%r", text)
             return
 
         # 结束词
@@ -959,8 +1052,30 @@ class VoiceAssistant(QObject):
 
     # ------------------------------------------------------------ 出声
     def _say(self, text: str) -> None:
-        """用本地 TTS 念一句（没开 TTS 就静默），同时在桌宠上冒一个气泡，让反馈看得见。"""
+        """用本地 TTS 念一句（没开 TTS 就静默），同时在桌宠上冒一个气泡，让反馈看得见。
+
+        **务必在 GUI 线程里出声**：``_say`` 通常由采集后台线程（``_run`` →
+        ``_handle_segment`` / ``_greet``）调用，而本地 TTS 的播放用的是
+        ``QMediaPlayer`` / ``QAudioOutput``——它们只能在 Qt 主线程使用。之前直接在
+        后台线程里调 ``tts.speak_text``，合成可能会跑，但 ``QMediaPlayer.play()``
+        在非主线程上是静默失败的（用户「只有气泡没有声音」），而且跨线程乱建 Qt
+        对象还会把事件循环搞坏，导致点一下桌宠就「未响应」卡死。
+        这里用 ``QTimer.singleShot(0, ...)`` 把真正的发声投递回 GUI 线程，
+        气泡与静音窗口的估算也一并放进去，保证线程安全。
+        """
         text = str(text or "").strip()
+        if not text:
+            return
+
+        # 从任何线程安全投递到 GUI 线程：信号是 queued connection，比跨线程 QTimer 稳。
+        try:
+            self.speak_requested.emit(text)
+        except Exception:  # noqa: BLE001
+            log.debug("语音助手无法投递发声请求，直接执行", exc_info=True)
+            self._do_speak(text)
+
+    def _do_speak(self, text: str) -> None:
+        """真正发声（必须在 GUI 线程执行）：冒气泡 + 本地 TTS + 估算静音窗口。"""
         if not text:
             return
         # 气泡：无论有没有开 TTS 都能看到的一句话反馈

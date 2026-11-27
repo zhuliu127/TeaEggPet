@@ -385,3 +385,111 @@ def test_say_mute_duration_capped():
         if orig is not None:
             sys.modules["pet.companion.tts"] = orig
     assert dur <= 8.5, f"静音窗口过长：{dur}"
+
+
+def _flush_qt():
+    """跑一轮事件循环，让 QTimer.singleShot(0) 投递的回调真正执行。"""
+    import time
+    from PySide6.QtCore import QCoreApplication
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(0.01)
+        QCoreApplication.processEvents()
+
+
+def test_say_defers_tts_off_caller_thread():
+    """_say 从「后台线程」调用时必须把发声投递回 GUI 线程执行 speak_text。
+
+    回归背景：_say 由采集后台线程调用，而本地 TTS 用 QMediaPlayer（只能主线程用）。
+    在后台线程里直接 speak_text → 无声 + 卡死。修复后用信号 speak_requested（queued
+    connection）把 _do_speak 投递回 GUI 线程：后台线程里 _say 立即返回、不执行
+    speak_text；等 GUI 事件循环转起来后才执行一次。
+    """
+    import sys, types, threading
+    a = _make({})
+    # _make 把 _say 打了桩，这里恢复真实的 _say 方法
+    a._say = va.VoiceAssistant._say.__get__(a, va.VoiceAssistant)
+    called = {"n": 0}
+
+    def _speak_text(text, store, kind="chat"):
+        called["n"] += 1
+        return False  # 不设静音窗口，纯检查调用时机
+
+    fake_tts = types.SimpleNamespace()
+    fake_tts.speak_text = _speak_text
+    fake_tts.speaker = lambda: types.SimpleNamespace(busy=False)
+    orig = sys.modules.get("pet.companion.tts")
+    sys.modules["pet.companion.tts"] = fake_tts
+    import pet.companion as _pkg
+    _orig_pkg_tts = getattr(_pkg, "tts", None)
+    setattr(_pkg, "tts", fake_tts)
+    # 用假 bubble，避免依赖真实 runtime
+    import pet.companion.runtime as rt_mod
+    _orig_bubble = getattr(rt_mod, "bubble", None)
+    rt_mod.bubble = lambda *a, **k: None
+    try:
+        # 模拟真实场景：从后台线程调用 _say
+        th = threading.Thread(target=lambda: a._say("你好"))
+        th.start()
+        th.join()
+        # 后台线程已返回、GUI 事件循环未跑：speak_text 不应在后台线程同步执行
+        assert called["n"] == 0, "speak_text 不应在调用（后台）线程同步执行"
+        _flush_qt()
+        # 事件循环跑完：应在 GUI 线程被调用一次
+        assert called["n"] == 1, "speak_text 应在 GUI 事件循环里被调用一次"
+    finally:
+        if orig is not None:
+            sys.modules["pet.companion.tts"] = orig
+        if _orig_pkg_tts is not None:
+            setattr(_pkg, "tts", _orig_pkg_tts)
+        if _orig_bubble is not None:
+            rt_mod.bubble = _orig_bubble
+
+
+def test_say_empty_text_does_nothing():
+    a = _make({})
+    a._say = va.VoiceAssistant._say.__get__(a, va.VoiceAssistant)
+    # 不应抛异常、不应投递
+    a._say("")
+    a._say("   ")
+    _flush_qt()
+
+
+# ---------------------------------------------------------------- 噪声门控（参考 dsh-dafeiyu-pro）
+def test_subtitle_junk_filtered():
+    """ASR 输出的字幕套话/背景音要能识别出来（参考实战幻听词表）。"""
+    assert va._looks_like_subtitle_junk("谢谢观看，请订阅点赞") is True
+    assert va._looks_like_subtitle_junk("字幕由网易云音乐提供") is True
+    assert va._looks_like_subtitle_junk("今天天气不错") is False
+    assert va._looks_like_subtitle_junk("小鱼小鱼") is False
+
+
+def test_zero_crossing_rate_noise_vs_tone():
+    """过零率：白噪声远高于低频正弦（人声其实介于两者，但噪声应可区分）。"""
+    import numpy as np
+    rng = np.random.default_rng(0)
+    noise = rng.standard_normal(4800).astype(np.float32) * 0.1
+    t = np.arange(4800) / 16000.0
+    tone = (0.1 * np.sin(2 * np.pi * 200 * t)).astype(np.float32)
+    zcr_noise = va._zero_crossing_rate(noise)
+    zcr_tone = va._zero_crossing_rate(tone)
+    assert zcr_noise > zcr_tone
+    assert zcr_tone < 0.35, f"低频音过零率不应超高：{zcr_tone}"
+    # 静音/单点不崩
+    assert va._zero_crossing_rate(np.zeros(0, dtype=np.float32)) == 0.0
+
+
+def test_voiced_ratio_speech_like_vs_flat():
+    """有声帧占比：整段能量均匀的类语音应高，前小后大（断续）应偏低。"""
+    import numpy as np
+    rng = np.random.default_rng(1)
+    # 类语音：持续有声
+    speechlike = (rng.standard_normal(16000).astype(np.float32) * 0.05)
+    # 断续：只有前半段有声
+    burst = np.concatenate([rng.standard_normal(8000).astype(np.float32) * 0.05,
+                            np.zeros(8000, dtype=np.float32)])
+    r_speech = va._voiced_ratio(speechlike)
+    r_burst = va._voiced_ratio(burst)
+    assert r_speech >= r_burst
+    assert 0.0 <= r_speech <= 1.0
