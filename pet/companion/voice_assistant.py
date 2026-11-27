@@ -195,6 +195,8 @@ class VoiceAssistant(QObject):
         self._mute_until = 0.0
         self._busy_reply = False  # AI 正在生成/朗读回复，期间不采集新的一句
         self._busy_deadline = 0.0  # 忙碌兜底超时（防回调没来）
+        self._model_main_info = ""  # 当前对话模型说明（给设置页显示）
+        self._model_kws_info = ""   # 当前唤醒模型说明（给设置页显示）
 
     # ------------------------------------------------------------ 配置读取
     def _store(self):
@@ -243,8 +245,11 @@ class VoiceAssistant(QObject):
         self._pending_selfie = False
         self._last_active = time.time()
         self._busy_reply = False
+        self._mute_until = 0.0
         self._engine = None
         self._kws_engine = None
+        self._model_main_info = ""
+        self._model_kws_info = ""
         self._register_chat_hook()
         self._thread = threading.Thread(target=self._run, name="VoiceAssistant", daemon=True)
         self._thread.start()
@@ -300,36 +305,62 @@ class VoiceAssistant(QObject):
             device = str(self._cfg("companion_whisper_device", "cpu") or "cpu")
             compute = str(self._cfg("companion_whisper_compute", "int8") or "int8")
             self._engine = asr.load_engine(model_dir, device=device, compute_type=compute)
+            self._model_main_info = asr.model_label(asr._guess_size_from_path(__import__("pathlib").Path(model_dir))) \
+                if hasattr(asr, "_guess_size_from_path") else model_dir
             log.info("语音助手主模型已加载：%s（device=%s,%s）", model_dir, device, compute)
-            # 唤醒词识别模型：默认 tiny（快）；若用户设了就用它
+            # 唤醒词识别模型：与对话模型**完全独立**，默认 tiny（快）。
+            # 1) 用户显式填了 KWS 模型路径 → 用它
+            # 2) 否则按「唤醒模型档位」companion_whisper_kws_model_size（默认 tiny）
+            #    去下载目录/扫描结果里找对应 size 的模型
+            # 3) 再找不到 → 退化用主模型
             kws_path = str(self._cfg("companion_whisper_kws_model_path", "") or "").strip()
-            if kws_path:
+            if kws_path and str(__import__("pathlib").Path(kws_path)).strip():
                 self._kws_engine = asr.load_engine(kws_path, device=device, compute_type=compute)
+                self._model_kws_info = kws_path
+                log.info("唤醒词模型（自定义路径）：%s", kws_path)
             else:
-                tiny_dir = self._find_tiny(model_dir)
+                kws_size = str(self._cfg("companion_whisper_kws_model_size", "tiny") or "tiny")
+                tiny_dir = self._find_size_dir(kws_size)
                 if tiny_dir:
-                    self._kws_engine = asr.load_engine(tiny_dir, device=device, compute_type="int8")
-                    log.info("唤醒词模型 tiny：%s", tiny_dir)
+                    # 唤醒词模型通常用 CPU/int8 最稳（短音频，不必上 GPU）
+                    self._kws_engine = asr.load_engine(tiny_dir, device="cpu", compute_type="int8")
+                    self._model_kws_info = f"{kws_size}  ·  {tiny_dir}"
+                    log.info("唤醒词模型 %s：%s", kws_size, tiny_dir)
                 else:
                     self._kws_engine = self._engine
-                    log.info("未找到 tiny，唤醒词改用主模型识别")
+                    self._model_kws_info = "（未单独下载 %s，暂用对话模型）" % kws_size
+                    log.info("未找到唤醒词模型 %s，唤醒词改用主模型识别", kws_size)
             return True
         except Exception as exc:  # noqa: BLE001
             log.exception("加载 Whisper 模型失败")
             self.error.emit(f"加载模型失败：{exc}")
             return False
 
-    def _find_tiny(self, fallback_main: str) -> str:
-        """找 tiny 模型目录；没有就返回空（用主引擎兜底）。"""
+    def _find_size_dir(self, size: str) -> str:
+        """找指定 size 的模型目录（下载目录优先，其次本机扫描）；没有返回空。"""
         try:
+            from pathlib import Path
+
             from . import asr
 
-            for item in asr.scan_local_models([self._cfg("companion_whisper_download_dir", "")]):
-                if item["size"] == "tiny":
+            download_root = str(self._cfg("companion_whisper_download_dir", "") or "").strip()
+            if download_root:
+                cand = Path(download_root).expanduser() / size
+                if (cand / "model.bin").is_file() and (cand / "config.json").is_file():
+                    return str(cand)
+            for item in asr.scan_local_models([download_root] if download_root else None):
+                if item["size"] == size:
                     return item["path"]
         except Exception:  # noqa: BLE001
             pass
         return ""
+
+    def model_info(self) -> dict:
+        """返回当前实际使用的模型信息（供设置页显示）。"""
+        return {
+            "dialog": getattr(self, "_model_main_info", "") or "",
+            "wake": getattr(self, "_model_kws_info", "") or "",
+        }
 
     def _candidate_devices(self) -> list[int | None]:
         """按配置的麦克风名找出候选设备序号（按优先级排序）。
@@ -627,11 +658,15 @@ class VoiceAssistant(QObject):
                 return
 
         if self._state == "idle":
-            # 只做唤醒词匹配（用 KWS 小模型，短促）
+            # 只做唤醒词匹配（用 KWS 小模型，短促）。用 initial_prompt 把 tiny
+            # 往「唤醒词」上偏置，短词识别更准。
+            wake = self._wake_word()
             text = asr.transcribe(self._kws_engine, audio, language="zh",
-                                  vad_filter=False, beam_size=1)
+                                  vad_filter=False, beam_size=1,
+                                  initial_prompt=f"{wake}。")
             self.heard.emit(f"[待命] {text}")
-            if _contains_any(text, [self._wake_word()]) or self._fuzzy_wake(text):
+            log.info("待命听到：%r（唤醒词=%r）", text, wake)
+            if _contains_any(text, [wake]) or self._fuzzy_wake(text):
                 self._enter_dialog()
             return
 
@@ -656,24 +691,39 @@ class VoiceAssistant(QObject):
         self._handle_dialog_text(text)
 
     def _fuzzy_wake(self, text: str) -> bool:
-        """唤醒词模糊匹配：模型把「小鱼小鱼」识别成「小鱼小玉」之类也认。
+        """唤醒词模糊匹配：模型把「小鱼小鱼」识别成「小鱼小玉/小雨小雨」之类也认。
 
-        规则：归一化后，唤醒词去重后的字大部分出现在句子里，且间隔不太远。
+        规则（宁缺毋滥，怕误唤醒）：
+        * 逐字按顺序命中比例要够；且
+        * 首字必须对得上（否则「今天天气不错」这种完全不相关的不能过）。
         """
         wake = _norm(self._wake_word())
         norm = _norm(text)
         if not wake or not norm:
             return False
-        # 逐字按顺序匹配的比例
+        # 逐字按顺序匹配
         j = 0
         hit = 0
         for ch in norm:
             if j < len(wake) and ch == wake[j]:
                 hit += 1
                 j += 1
-        # 「小鱼小鱼」共 4 字，命中 >= 3 且含「鱼」视为命中
+        # 字符计数匹配（容忍同音错字，如「鱼」听成「雨/玉」；「小鱼小鱼」里两个「小」
+        # 都要对上）。命中的 wake 字符数 / wake 长度。
+        from collections import Counter
+
+        wc = Counter(wake)
+        nc = Counter(norm)
+        overlap = sum(min(cnt, nc[ch]) for ch, cnt in wc.items())
+        first_ok = wake[0] in norm
+        # 至少命中一半以上且首字在，才认（宁可让她没被唤醒也不要被随便一句话唤醒）
+        if first_ok and overlap >= max(2, (len(wake) + 1) // 2):
+            return True
+        if hit >= max(2, len(wake) - 1):
+            return True
+        # 兜底：去掉首个重复字后（「小鱼」）整段出现
         base = wake.replace(wake[0], "", 1) if len(wake) > 1 else wake
-        return hit >= max(2, len(wake) - 1) or (base and _norm(base) in norm)
+        return bool(base and _norm(base) in norm)
 
     def _enter_dialog(self) -> None:
         self._last_active = time.time()
@@ -892,11 +942,31 @@ class VoiceAssistant(QObject):
             return False
 
     def _is_muted(self) -> bool:
-        # 回复忙碌有兜底超时：万一「回复完成」回调没来（网络错误等），
-        # 最多忙 25 秒，避免麦克风永远静音。
-        if self._busy_reply and self._busy_deadline and time.time() > self._busy_deadline:
+        """是否需要丢弃当前麦克风数据（避免把「她自己说话」当成用户语音）。
+
+        **务必保守**：只有下面几种「我们确知她在出声」的短暂时段才静音，
+        任何时刻都不能永久静音，否则麦克风收不到用户声音 → 永远唤不醒。
+
+        之前出过一次严重事故：直接读全局 TTS 的 ``busy`` 判断，而那个标志一旦
+        因为合成线程异常/本地 TTS 服务断开而没复位，就会**永久 True**，采集端
+        把每一帧都丢掉（日志里整屏都是「她正在说话，已静音采集」），于是用户
+        对着麦克风喊什么都没用。现在改成：
+        1) ``_mute_until``：只由我们自己 ``_say``/念回复时设置，按字数估算 + 兜底上限；
+        2) ``_busy_reply``：AI 回复生成期间，带 25 秒硬超时；
+        3) 全局 TTS busy：**只在上面两个窗口之内**才采信，避免被外部卡死的 busy 拖死。
+        """
+        now = time.time()
+        # 回复忙碌硬超时：回调没来也不超过 25 秒
+        if self._busy_reply and self._busy_deadline and now > self._busy_deadline:
             self._busy_reply = False
-        return time.time() < self._mute_until or self._busy_reply or self._tts_busy()
+        # 静音窗口兜底上限（防止 _mute_until 因异常被设得离谱）
+        if self._mute_until and now > self._mute_until + 30.0:
+            self._mute_until = 0.0
+
+        in_own_window = now < self._mute_until
+        # 只在我们自己确知她在出声的窗口内静音；窗口之外一律不静音，
+        # 确保麦克风永远能听到用户（历史上被卡死的全局 busy 拖死过）。
+        return bool(in_own_window or self._busy_reply)
 
 
     # ------------------------------------------------------------ 状态

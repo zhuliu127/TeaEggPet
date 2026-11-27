@@ -106,10 +106,11 @@ DEFAULTS: dict[str, Any] = {
     "companion_voice_dialog_timeout": 60,      # 对话模式空闲多少秒自动退出（0=不超时）
     "companion_voice_device": "",              # 麦克风设备名（空=系统默认）
     # Whisper 模型
-    "companion_whisper_model_size": "base",    # tiny/base/small/medium/large-v3
+    "companion_whisper_model_size": "base",    # 对话整合转写用的模型档位 tiny/base/small/medium/large-v3
     "companion_whisper_model_path": "",         # 用户手填模型目录（优先）
     "companion_whisper_download_dir": "",       # 下载落点（空=用 <companion>/whisper-models）
-    "companion_whisper_kws_model_path": "",     # 唤醒词识别模型目录（空=自动找 tiny）
+    "companion_whisper_kws_model_size": "tiny", # 唤醒词/结束词识别用的模型档位（默认 tiny 最快）
+    "companion_whisper_kws_model_path": "",     # 唤醒词识别模型目录（空=自动找对应 size）
     "companion_whisper_device": "cpu",          # cpu | cuda
     "companion_whisper_compute": "int8",        # int8 | int8_float16 | float16 | float32
     "companion_whisper_beam": 1,               # 对话转写 beam（1=快）

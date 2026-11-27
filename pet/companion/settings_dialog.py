@@ -941,6 +941,13 @@ class CompanionSettingsDialog(QDialog):
         form.addRow(sep)
 
         # ---- Whisper 模型 ----
+        # 说明当前**实际在用**的模型（唤醒 / 对话分开显示）
+        self.model_current_label = QLabel("")
+        self.model_current_label.setWordWrap(True)
+        self.model_current_label.setStyleSheet("color:#3a7bd5;")
+        form.addRow("当前使用", self.model_current_label)
+
+        # ① 对话识别模型（整句转写）
         row = QHBoxLayout()
         self.whisper_size = QComboBox()
         for size, label, _hint in asr_mod.MODEL_SIZES:
@@ -950,7 +957,7 @@ class CompanionSettingsDialog(QDialog):
         self.whisper_download_btn.setToolTip("从国内镜像（hf-mirror.com）下载所选模型，无需翻墙")
         self.whisper_download_btn.clicked.connect(self._download_whisper_model)
         row.addWidget(self.whisper_download_btn)
-        form.addRow("识别模型", self._wrap(row))
+        form.addRow("对话识别模型", self._wrap(row))
 
         # ---- 下载进度（进度条 + 已下/总量/速度文字）----
         self.whisper_progress = QProgressBar()
@@ -979,12 +986,53 @@ class CompanionSettingsDialog(QDialog):
         row.addWidget(self.whisper_path, 1)
         row.addWidget(btn_pick)
         row.addWidget(btn_scan)
-        form.addRow("模型路径", self._wrap(row))
+        form.addRow("对话模型路径", self._wrap(row))
 
         self.whisper_local_list = QComboBox()
         self.whisper_local_list.setToolTip("本机扫描到的模型，选中即填入上面的路径")
         self.whisper_local_list.activated.connect(self._use_scanned_whisper)
         form.addRow("已有模型", self.whisper_local_list)
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        form.addRow(sep2)
+
+        # ② 唤醒词识别模型（短词匹配，独立于对话模型）
+        row = QHBoxLayout()
+        self.kws_size = QComboBox()
+        for size, label, _hint in asr_mod.MODEL_SIZES:
+            self.kws_size.addItem(label, size)
+        row.addWidget(self.kws_size, 1)
+        self.kws_download_btn = QPushButton("下载唤醒模型")
+        self.kws_download_btn.setToolTip("唤醒词识别用的小模型（tiny 最快最省），和对话模型分开存")
+        self.kws_download_btn.clicked.connect(self._download_kws_model)
+        row.addWidget(self.kws_download_btn)
+        form.addRow("唤醒识别模型", self._wrap(row))
+
+        self.kws_progress = QProgressBar()
+        self.kws_progress.setRange(0, 100)
+        self.kws_progress.setValue(0)
+        self.kws_progress.setTextVisible(True)
+        self.kws_progress.setFormat("%p%")
+        self.kws_progress.setVisible(False)
+        self.kws_progress_label = QLabel("")
+        self.kws_progress_label.setWordWrap(True)
+        self.kws_progress_label.setVisible(False)
+        kws_col = QVBoxLayout()
+        kws_col.setContentsMargins(0, 0, 0, 0)
+        kws_col.setSpacing(2)
+        kws_col.addWidget(self.kws_progress)
+        kws_col.addWidget(self.kws_progress_label)
+        form.addRow("唤醒下载进度", self._wrap(kws_col))
+
+        row = QHBoxLayout()
+        self.kws_path = QLineEdit()
+        self.kws_path.setPlaceholderText("留空 = 自动用上面档位的已下载模型；也可填模型目录")
+        btn_kws_pick = QPushButton("选择…")
+        btn_kws_pick.clicked.connect(self._pick_kws_path)
+        row.addWidget(self.kws_path, 1)
+        row.addWidget(btn_kws_pick)
+        form.addRow("唤醒模型路径", self._wrap(row))
 
         row = QHBoxLayout()
         self.whisper_device = QComboBox()
@@ -994,9 +1042,8 @@ class CompanionSettingsDialog(QDialog):
         for text, data in (("int8（CPU 推荐）", "int8"), ("float16（GPU）", "float16"),
                            ("int8_float16（GPU 省显存）", "int8_float16"), ("float32", "float32")):
             self.whisper_compute.addItem(text, data)
-        row.addWidget(QLabel("运行设备"))
+        row.addWidget(QLabel("对话模型运行设备"))
         row.addWidget(self.whisper_device)
-        row.addWidget(QLabel("精度"))
         row.addWidget(self.whisper_compute)
         row.addStretch(1)
         form.addRow("性能", self._wrap(row))
@@ -1016,10 +1063,10 @@ class CompanionSettingsDialog(QDialog):
         form.addRow("", self._wrap(btn_row))
 
         hint = QLabel(
-            "小提示：唤醒词/结束词识别用最小的 tiny 模型做关键词匹配（毫秒级），"
-            "对话整句用上面选的模型（base 日常够用，small 更准）。\n"
-            "模型下载走国内镜像；也能自己下 faster-whisper 模型后填路径或点「自动搜索本机」。\n"
-            "唤醒词/结束词、指令都能改；「确认」表示二次确认拍自拍。")
+            "小提示：**唤醒模型**和**对话模型**是两套、可分开设置——唤醒/结束词识别用小的"
+            "（tiny 最快，够认「小鱼小鱼」），对话整句用大的（base 日常够用，small 更准）。\n"
+            "点「应用并重启监听」后，上方「当前使用」会显示实际加载的两个模型。\n"
+            "模型下载走国内镜像；也能自己下 faster-whisper 模型后填路径或点「自动搜索本机」。")
         hint.setWordWrap(True)
         form.addRow("", hint)
         return page
@@ -1163,6 +1210,59 @@ class CompanionSettingsDialog(QDialog):
 
         self._run_task(run, ok, self.whisper_download_btn, bad)
 
+    def _pick_kws_path(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "选择唤醒词模型目录", self.kws_path.text().strip() or "")
+        if folder:
+            self.kws_path.setText(folder)
+
+    def _download_kws_model(self) -> None:
+        """下载唤醒词识别用的小模型（与对话模型分开存）。"""
+        from . import asr as asr_mod
+
+        size = self.kws_size.currentData() or "tiny"
+        store = self.store
+        dest = str(store.whisper_models_dir())
+        self.kws_download_btn.setEnabled(False)
+        self.kws_progress.setValue(0)
+        self.kws_progress.setFormat("%p%")
+        self.kws_progress.setVisible(True)
+        self.kws_progress_label.setVisible(True)
+        self.kws_progress_label.setText(f"准备下载唤醒模型 {size} …")
+        self.voice_status.setText(f"开始下载唤醒模型 {size}（从国内镜像）…")
+
+        def run():
+            bridge = self._bridge
+
+            def _report(payload):
+                def _apply(p=payload):
+                    if isinstance(p, dict):
+                        pct = p.get("percent")
+                        if pct is not None:
+                            self.kws_progress.setValue(int(round(float(pct))))
+                        txt = p.get("text") or p.get("msg")
+                        if txt:
+                            self.kws_progress_label.setText(str(txt))
+                            self.voice_status.setText(str(txt))
+                    else:
+                        self.kws_progress_label.setText(str(p))
+                bridge.post(_apply)
+
+            return asr_mod.download_model(size, dest, on_progress=_report)
+
+        def ok(path):
+            self.kws_download_btn.setEnabled(True)
+            self.kws_progress.setValue(100)
+            self.kws_progress_label.setText("唤醒模型下载完成")
+            self.voice_status.setText(f"唤醒模型下载完成：{path}")
+            self._scan_whisper_models()
+
+        def bad(msg):
+            self.kws_download_btn.setEnabled(True)
+            self.kws_progress_label.setText(f"下载失败：{msg}")
+            self.voice_status.setText(f"下载唤醒模型失败：{msg}")
+
+        self._run_task(run, ok, self.kws_download_btn, bad)
+
     def _restart_voice_assistant(self) -> None:
         # 先把当前表单值落库，再重载（不然重启还是旧配置）
         try:
@@ -1171,16 +1271,50 @@ class CompanionSettingsDialog(QDialog):
             log.exception("保存语音助手设置失败")
         try:
             runtime.reload_voice_assistant()
-            self.voice_status.setText("已按新设置重启监听")
+            self.voice_status.setText("已按新设置重启监听（正在后台加载模型…稍等几秒刷新「当前使用」）")
         except Exception as exc:  # noqa: BLE001
             self.voice_status.setText(f"重启失败：{exc}")
+        # 稍等一会儿再刷新「当前使用」标签（模型在后台线程加载）
+        from PySide6.QtCore import QTimer
+
+        QTimer.singleShot(2500, self._refresh_model_current)
+
+    def _refresh_model_current(self) -> None:
+        """把「当前实际加载的唤醒/对话模型」显示出来，让用户看清正在用哪个。"""
+        try:
+            va = runtime.voice_assistant()
+        except Exception:  # noqa: BLE001
+            va = None
+        if va is None:
+            self.model_current_label.setText("（语音助手未启动，开启总开关并保存后生效）")
+            return
+        info = {}
+        try:
+            info = va.model_info() or {}
+        except Exception:  # noqa: BLE001
+            pass
+        dialog = info.get("dialog") or ""
+        wake = info.get("wake") or ""
+        if not dialog and not wake:
+            self.model_current_label.setText("（还没有可用模型，请下载或指定模型路径）")
+            return
+        self.model_current_label.setText(
+            f"对话识别：{dialog or '未加载'}\n唤醒识别：{wake or '未加载'}")
 
     def _show_voice_state(self) -> None:
         va = runtime.voice_assistant()
         if va is None:
             self.voice_status.setText("语音助手还没启动（确认已开启总开关并保存）")
             return
-        self.voice_status.setText(f"当前状态：{va.state}")
+        info = {}
+        try:
+            info = va.model_info() or {}
+        except Exception:  # noqa: BLE001
+            pass
+        self.voice_status.setText(
+            f"当前状态：{va.state}\n对话模型：{info.get('dialog') or '未加载'}\n"
+            f"唤醒模型：{info.get('wake') or '未加载'}")
+        self._refresh_model_current()
 
     def _tab_proactive(self) -> QWidget:
         page = QWidget(self)
@@ -1545,12 +1679,18 @@ class CompanionSettingsDialog(QDialog):
         si = self.whisper_size.findData(size)
         self.whisper_size.setCurrentIndex(max(0, si))
         self.whisper_path.setText(str(t.get("companion_whisper_model_path", "") or ""))
+        ksize = str(t.get("companion_whisper_kws_model_size", "tiny") or "tiny")
+        ki = self.kws_size.findData(ksize)
+        self.kws_size.setCurrentIndex(max(0, ki))
+        self.kws_path.setText(str(t.get("companion_whisper_kws_model_path", "") or ""))
         wd = str(t.get("companion_whisper_device", "cpu") or "cpu")
         wi = self.whisper_device.findData(wd)
         self.whisper_device.setCurrentIndex(max(0, wi))
         wc = str(t.get("companion_whisper_compute", "int8") or "int8")
         ci = self.whisper_compute.findData(wc)
         self.whisper_compute.setCurrentIndex(max(0, ci))
+        # 打开对话框就显示当前实际在用的模型
+        self._refresh_model_current()
 
     def _collect(self) -> dict[str, Any]:
         return {
@@ -1614,6 +1754,8 @@ class CompanionSettingsDialog(QDialog):
             "companion_voice_dialog_timeout": int(self.voice_timeout.value()),
             "companion_whisper_model_size": self.whisper_size.currentData() or "base",
             "companion_whisper_model_path": self.whisper_path.text().strip(),
+            "companion_whisper_kws_model_size": self.kws_size.currentData() or "tiny",
+            "companion_whisper_kws_model_path": self.kws_path.text().strip(),
             "companion_whisper_device": self.whisper_device.currentData() or "cpu",
             "companion_whisper_compute": self.whisper_compute.currentData() or "int8",
         }
