@@ -5513,6 +5513,17 @@ def main(argv: list[str] | None = None, enable_chat: bool = True) -> int:
     app = QApplication(argv)
     app.setApplicationName(APP_DIR_NAME)
     app.setQuitOnLastWindowClosed(False)
+    # 正式桌宠图标：设成全局应用图标，任务栏/标题栏/所有窗口统一用它。
+    # （assets/icon.ico 由 tools/build_icon.py 从「深海茶蛋桌面宠物」立绘生成；
+    #  load_application_icon 拿不到就给空图标，不会崩。）
+    try:
+        from .application_icon import load_application_icon
+
+        _app_icon = load_application_icon()
+        if not _app_icon.isNull():
+            app.setWindowIcon(_app_icon)
+    except Exception:  # noqa: BLE001
+        logging.debug("设置应用图标失败", exc_info=True)
     # 图片解码上限（像素级别的一处设定）：Qt 默认 256 MB/张（本机 Qt 6.11.2 实测），
     # 用户给的超大图会**直接读不出来**而不是慢一点——聊天附件预览、设置页头像、
     # 趣味图片弹窗都吃这条上限。踩点放在这里而不是各调用点：它是静态设置，

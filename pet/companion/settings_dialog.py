@@ -196,6 +196,7 @@ class CompanionSettingsDialog(QDialog):
         self.tabs.addTab(self._tab_walk(), "溜达")
         self.tabs.addTab(self._tab_proactive(), "主动对话")
         self.tabs.addTab(self._tab_voice(), "语音")
+        self.tabs.addTab(self._scrolled(self._tab_assistant()), "语音助手")
         self.tabs.addTab(self._tab_about(), "说明")
         root.addWidget(self.tabs, 1)
 
@@ -860,6 +861,225 @@ class CompanionSettingsDialog(QDialog):
 
         self._run_task(run, ok, self.tts_play_btn, bad)
 
+    def _tab_assistant(self) -> QWidget:
+        """语音助手：本地 Whisper 听写 + 唤醒词/结束词 + 语音指令。"""
+        from . import asr as asr_mod
+
+        page = QWidget(self)
+        form = QFormLayout(page)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.voice_enabled = QCheckBox("开启语音助手（麦克风常驻监听）")
+        self.voice_enabled.setToolTip(
+            "开启后程序会一直监听麦克风：说唤醒词进入对话模式，之后说的话会被"
+            "本地 Whisper 转成文字发进 AI 对话。全程本机识别，不联网。")
+        form.addRow("总开关", self.voice_enabled)
+
+        hint0 = QLabel(
+            "工作方式：说「唤醒词」叫醒 → 进入对话模式，说的话自动发给 AI 并回复；"
+            "说「结束词」退出。对话中说「自拍」会先问你要不要拍，你说「确认」才拍；"
+            "说「溜达」出去、说「回家」回来（会发自拍）。")
+        hint0.setWordWrap(True)
+        form.addRow("", hint0)
+
+        row = QHBoxLayout()
+        self.voice_wake = QLineEdit()
+        self.voice_wake.setPlaceholderText(asr_mod and "小鱼小鱼")
+        self.voice_sleep = QLineEdit()
+        self.voice_sleep.setPlaceholderText("休息一下")
+        row.addWidget(QLabel("唤醒词"))
+        row.addWidget(self.voice_wake, 1)
+        row.addWidget(QLabel("结束词"))
+        row.addWidget(self.voice_sleep, 1)
+        form.addRow("词", self._wrap(row))
+
+        row = QHBoxLayout()
+        self.voice_device = QComboBox()
+        self.voice_device.setEditable(True)
+        self.voice_device.addItem("（系统默认麦克风）", "")
+        try:
+            import sounddevice as sd
+
+            for dev in sd.query_devices():
+                if int(dev.get("max_input_channels", 0)) > 0:
+                    self.voice_device.addItem(str(dev.get("name", "")), str(dev.get("name", "")))
+        except Exception:  # noqa: BLE001
+            pass
+        self.voice_device.setToolTip("选输入设备（麦克风）。系统默认通常就行")
+        btn_dev = QPushButton("刷新设备")
+        btn_dev.clicked.connect(self._refresh_voice_devices)
+        row.addWidget(self.voice_device, 1)
+        row.addWidget(btn_dev)
+        form.addRow("麦克风", self._wrap(row))
+
+        self.voice_timeout = QSpinBox()
+        self.voice_timeout.setRange(0, 600)
+        self.voice_timeout.setSuffix(" 秒")
+        self.voice_timeout.setToolTip("对话模式下多久没说话就自动退出（0=不超时）")
+        form.addRow("对话空闲超时", self.voice_timeout)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        form.addRow(sep)
+
+        # ---- Whisper 模型 ----
+        row = QHBoxLayout()
+        self.whisper_size = QComboBox()
+        for size, label, _hint in asr_mod.MODEL_SIZES:
+            self.whisper_size.addItem(label, size)
+        row.addWidget(self.whisper_size, 1)
+        self.whisper_download_btn = QPushButton("下载模型")
+        self.whisper_download_btn.setToolTip("从国内镜像（hf-mirror.com）下载所选模型，无需翻墙")
+        self.whisper_download_btn.clicked.connect(self._download_whisper_model)
+        row.addWidget(self.whisper_download_btn)
+        form.addRow("识别模型", self._wrap(row))
+
+        row = QHBoxLayout()
+        self.whisper_path = QLineEdit()
+        self.whisper_path.setPlaceholderText("留空 = 用下载的模型；也可填自己下好的模型目录")
+        btn_pick = QPushButton("选择…")
+        btn_pick.clicked.connect(self._pick_whisper_path)
+        btn_scan = QPushButton("自动搜索本机")
+        btn_scan.clicked.connect(self._scan_whisper_models)
+        row.addWidget(self.whisper_path, 1)
+        row.addWidget(btn_pick)
+        row.addWidget(btn_scan)
+        form.addRow("模型路径", self._wrap(row))
+
+        self.whisper_local_list = QComboBox()
+        self.whisper_local_list.setToolTip("本机扫描到的模型，选中即填入上面的路径")
+        self.whisper_local_list.activated.connect(self._use_scanned_whisper)
+        form.addRow("已有模型", self.whisper_local_list)
+
+        row = QHBoxLayout()
+        self.whisper_device = QComboBox()
+        self.whisper_device.addItem("CPU", "cpu")
+        self.whisper_device.addItem("GPU（CUDA，需已装显卡驱动）", "cuda")
+        self.whisper_compute = QComboBox()
+        for text, data in (("int8（CPU 推荐）", "int8"), ("float16（GPU）", "float16"),
+                           ("int8_float16（GPU 省显存）", "int8_float16"), ("float32", "float32")):
+            self.whisper_compute.addItem(text, data)
+        row.addWidget(QLabel("运行设备"))
+        row.addWidget(self.whisper_device)
+        row.addWidget(QLabel("精度"))
+        row.addWidget(self.whisper_compute)
+        row.addStretch(1)
+        form.addRow("性能", self._wrap(row))
+
+        self.voice_status = QLabel("")
+        self.voice_status.setWordWrap(True)
+        form.addRow("状态", self.voice_status)
+
+        btn_row = QHBoxLayout()
+        self.voice_restart_btn = QPushButton("应用并重启监听")
+        self.voice_restart_btn.clicked.connect(self._restart_voice_assistant)
+        self.voice_status_btn = QPushButton("查看识别状态")
+        self.voice_status_btn.clicked.connect(self._show_voice_state)
+        btn_row.addWidget(self.voice_restart_btn)
+        btn_row.addWidget(self.voice_status_btn)
+        btn_row.addStretch(1)
+        form.addRow("", self._wrap(btn_row))
+
+        hint = QLabel(
+            "小提示：唤醒词/结束词识别用最小的 tiny 模型做关键词匹配（毫秒级），"
+            "对话整句用上面选的模型（base 日常够用，small 更准）。\n"
+            "模型下载走国内镜像；也能自己下 faster-whisper 模型后填路径或点「自动搜索本机」。\n"
+            "唤醒词/结束词、指令都能改；「确认」表示二次确认拍自拍。")
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+        return page
+
+    def _refresh_voice_devices(self) -> None:
+        current = self.voice_device.currentData()
+        self.voice_device.clear()
+        self.voice_device.addItem("（系统默认麦克风）", "")
+        try:
+            import sounddevice as sd
+
+            for dev in sd.query_devices():
+                if int(dev.get("max_input_channels", 0)) > 0:
+                    self.voice_device.addItem(str(dev.get("name", "")), str(dev.get("name", "")))
+        except Exception as exc:  # noqa: BLE001
+            self.voice_status.setText(f"读取麦克风列表失败：{exc}")
+            return
+        idx = self.voice_device.findData(current)
+        if idx >= 0:
+            self.voice_device.setCurrentIndex(idx)
+
+    def _pick_whisper_path(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "选择 Whisper 模型目录", self.whisper_path.text().strip() or "")
+        if folder:
+            self.whisper_path.setText(folder)
+
+    def _scan_whisper_models(self) -> None:
+        from . import asr as asr_mod
+
+        extra = []
+        if self.whisper_path.text().strip():
+            extra.append(self.whisper_path.text().strip())
+        found = asr_mod.scan_local_models(extra)
+        self.whisper_local_list.clear()
+        if not found:
+            self.voice_status.setText("本机没找到可用的 Whisper 模型，点「下载模型」下一个吧")
+            self.whisper_local_list.addItem("（没找到）", "")
+            return
+        for item in found:
+            self.whisper_local_list.addItem(item["label"], item["path"])
+        self.voice_status.setText(f"找到 {len(found)} 个模型，在上面的「已有模型」里选一个即可")
+
+    def _use_scanned_whisper(self, _index: int) -> None:
+        path = self.whisper_local_list.currentData()
+        if path:
+            self.whisper_path.setText(str(path))
+
+    def _download_whisper_model(self) -> None:
+        from . import asr as asr_mod
+
+        size = self.whisper_size.currentData() or "base"
+        store = self.store
+        dest = str(store.whisper_models_dir())
+        self.whisper_download_btn.setEnabled(False)
+        self.voice_status.setText(f"开始下载 {size}（从国内镜像）…")
+
+        def run():
+            bridge = self._bridge
+
+            def _report(msg):
+                bridge.post(lambda m=msg: self.voice_status.setText(m))
+
+            return asr_mod.download_model(size, dest, on_progress=_report)
+
+        def ok(path):
+            self.whisper_download_btn.setEnabled(True)
+            self.whisper_path.setText(str(path))
+            self.voice_status.setText(f"下载完成：{path}")
+            self._scan_whisper_models()
+
+        def bad(msg):
+            self.whisper_download_btn.setEnabled(True)
+            self.voice_status.setText(f"下载失败：{msg}")
+
+        self._run_task(run, ok, self.whisper_download_btn, bad)
+
+    def _restart_voice_assistant(self) -> None:
+        # 先把当前表单值落库，再重载（不然重启还是旧配置）
+        try:
+            self.store.apply(self._collect())
+        except Exception:  # noqa: BLE001
+            log.exception("保存语音助手设置失败")
+        try:
+            runtime.reload_voice_assistant()
+            self.voice_status.setText("已按新设置重启监听")
+        except Exception as exc:  # noqa: BLE001
+            self.voice_status.setText(f"重启失败：{exc}")
+
+    def _show_voice_state(self) -> None:
+        va = runtime.voice_assistant()
+        if va is None:
+            self.voice_status.setText("语音助手还没启动（确认已开启总开关并保存）")
+            return
+        self.voice_status.setText(f"当前状态：{va.state}")
+
     def _tab_proactive(self) -> QWidget:
         page = QWidget(self)
         form = QFormLayout(page)
@@ -1205,6 +1425,31 @@ class CompanionSettingsDialog(QDialog):
         self._sync_lib_detail()
         self._refresh_plan()
 
+        # ---- 语音助手 ----
+        self.voice_enabled.setChecked(bool(t.get("companion_voice_enabled", False)))
+        self.voice_wake.setText(str(t.get("companion_voice_wake_word", "小鱼小鱼") or "小鱼小鱼"))
+        self.voice_sleep.setText(str(t.get("companion_voice_sleep_word", "休息一下") or "休息一下"))
+        dev = str(t.get("companion_voice_device", "") or "")
+        di = self.voice_device.findData(dev)
+        if di >= 0:
+            self.voice_device.setCurrentIndex(di)
+        else:
+            self.voice_device.setCurrentText(dev)
+        try:
+            self.voice_timeout.setValue(int(t.get("companion_voice_dialog_timeout", 60) or 0))
+        except (TypeError, ValueError):
+            self.voice_timeout.setValue(60)
+        size = str(t.get("companion_whisper_model_size", "base") or "base")
+        si = self.whisper_size.findData(size)
+        self.whisper_size.setCurrentIndex(max(0, si))
+        self.whisper_path.setText(str(t.get("companion_whisper_model_path", "") or ""))
+        wd = str(t.get("companion_whisper_device", "cpu") or "cpu")
+        wi = self.whisper_device.findData(wd)
+        self.whisper_device.setCurrentIndex(max(0, wi))
+        wc = str(t.get("companion_whisper_compute", "int8") or "int8")
+        ci = self.whisper_compute.findData(wc)
+        self.whisper_compute.setCurrentIndex(max(0, ci))
+
     def _collect(self) -> dict[str, Any]:
         return {
             "companion_image_provider": ("comfyui" if self.mode_local.isChecked()
@@ -1259,6 +1504,16 @@ class CompanionSettingsDialog(QDialog):
             "companion_qwen_style": self.qwen_style.toPlainText().strip(),
             "companion_comfy_pixels": int(self.comfy_pixels.currentData() or 780_000),
             "companion_comfy_negative": self.comfy_negative.toPlainText().strip(),
+            # ---- 语音助手 ----
+            "companion_voice_enabled": bool(self.voice_enabled.isChecked()),
+            "companion_voice_wake_word": self.voice_wake.text().strip() or "小鱼小鱼",
+            "companion_voice_sleep_word": self.voice_sleep.text().strip() or "休息一下",
+            "companion_voice_device": self.voice_device.currentData() or self.voice_device.currentText().strip(),
+            "companion_voice_dialog_timeout": int(self.voice_timeout.value()),
+            "companion_whisper_model_size": self.whisper_size.currentData() or "base",
+            "companion_whisper_model_path": self.whisper_path.text().strip(),
+            "companion_whisper_device": self.whisper_device.currentData() or "cpu",
+            "companion_whisper_compute": self.whisper_compute.currentData() or "int8",
         }
 
     def _on_save(self) -> None:

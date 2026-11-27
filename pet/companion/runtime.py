@@ -10,6 +10,7 @@ log = logging.getLogger(__name__)
 _app = None
 _service = None
 _proactive = None
+_voice_assistant = None
 _settings_dialog = None
 _library_dialog = None
 _store = None
@@ -30,6 +31,7 @@ def attach(app) -> None:
             _start_schedule_bootstrap(app)
             _start_chat_voice(app)
             _start_tts_warmup(app)
+            _start_voice_assistant(app)
             _hook_chat_schedule()
             log.info("陪伴扩展已就绪")
         except Exception:
@@ -50,6 +52,40 @@ def _start_proactive(app) -> None:
         QTimer.singleShot(6000, _proactive.start)
     except Exception:
         log.exception("主动对话初始化失败（其余功能不受影响）")
+
+
+def _start_voice_assistant(app) -> None:
+    """启动麦克风语音助手（总开关关闭时不启动）。
+
+    延迟几秒，等主窗口、配置、模型目录都就绪后再开，避免开机抢资源。
+    出错只在日志里记，不影响桌宠其它功能。
+    """
+    global _voice_assistant
+    if _voice_assistant is not None:
+        return
+    try:
+        from PySide6.QtCore import QTimer
+
+        from .voice_assistant import VoiceAssistant
+
+        _voice_assistant = VoiceAssistant(app)
+        QTimer.singleShot(4000, _voice_assistant.start)
+    except Exception:
+        log.exception("语音助手初始化失败（其余功能不受影响）")
+
+
+def voice_assistant():
+    """已经挂上的语音助手实例（没启动/未启用返回 None，不会顺手启动）。"""
+    return _voice_assistant
+
+
+def reload_voice_assistant() -> None:
+    """设置改后按新参数重来（总开关、词、模型、麦克风都可能变）。"""
+    if _voice_assistant is not None:
+        try:
+            _voice_assistant.reload()
+        except Exception:
+            log.exception("重载语音助手失败")
 
 
 def _start_chat_voice(app) -> None:
@@ -676,7 +712,13 @@ def open_library(parent=None, *, topmost: bool = True, on_closed=None) -> None:
 
 
 def shutdown() -> None:
-    global _service, _settings_dialog, _library_dialog, _proactive
+    global _service, _settings_dialog, _library_dialog, _proactive, _voice_assistant
+    if _voice_assistant is not None:
+        try:
+            _voice_assistant.stop()
+        except Exception:
+            log.debug("停止语音助手失败", exc_info=True)
+        _voice_assistant = None
     if _proactive is not None:
         try:
             _proactive.stop()

@@ -2282,6 +2282,33 @@ class ChatWindow(QDialog):
         self._last_user_text = request_text
         self._begin_generation(request_text, image_payloads=image_payloads)
 
+    def voice_submit(self, text: str) -> None:
+        """语音投递：把一段（已识别成文字的）用户消息当成在输入框打字发出。
+
+        与 ``send_message`` 走同一条落盘/记忆/prompt 路径，但文本由调用方给入
+        （不读输入框）。用于语音助手把识别结果送进 AI 对话，程序自动回复。
+        正在生成时先停掉上一条，保证语音对话一问一答。
+        """
+        text = str(text or "").strip()
+        if not text:
+            return
+        if self.service.busy:
+            self.service.stop()
+        self.input.clear()
+        synced, absorbed = self.store.append_message(
+            self.session, ChatMessage("user", text)
+        )
+        if synced is None:
+            self.session.messages.append(ChatMessage("user", text))
+        else:
+            self.session = synced
+            if absorbed:
+                self._load()
+                self._refresh_sessions()
+        self._add("user", text)
+        self._last_user_text = text
+        self._begin_generation(text)
+
     def _chat_memory(self) -> ChatMemory:
         """当前角色的对话全局记忆（与会话文件同目录；按需构造——实例很轻，锁按路径共享）。"""
         return ChatMemory(self.store.root / self.character_id / "memory.json")

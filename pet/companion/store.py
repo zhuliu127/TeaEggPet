@@ -99,6 +99,20 @@ DEFAULTS: dict[str, Any] = {
     "companion_tts_text_lang": "zh",
     "companion_tts_prompt_lang": "zh",
     "companion_tts_speed": 1.0,
+    # ---- 语音助手（本地 Whisper 麦克风听写 + 唤醒词）----
+    "companion_voice_enabled": False,          # 总开关
+    "companion_voice_wake_word": "小鱼小鱼",   # 唤醒词
+    "companion_voice_sleep_word": "休息一下",  # 结束词
+    "companion_voice_dialog_timeout": 60,      # 对话模式空闲多少秒自动退出（0=不超时）
+    "companion_voice_device": "",              # 麦克风设备名（空=系统默认）
+    # Whisper 模型
+    "companion_whisper_model_size": "base",    # tiny/base/small/medium/large-v3
+    "companion_whisper_model_path": "",         # 用户手填模型目录（优先）
+    "companion_whisper_download_dir": "",       # 下载落点（空=用 <companion>/whisper-models）
+    "companion_whisper_kws_model_path": "",     # 唤醒词识别模型目录（空=自动找 tiny）
+    "companion_whisper_device": "cpu",          # cpu | cuda
+    "companion_whisper_compute": "int8",        # int8 | int8_float16 | float16 | float32
+    "companion_whisper_beam": 1,               # 对话转写 beam（1=快）
 }
 
 
@@ -155,6 +169,16 @@ class CompanionStore:
 
     def presets_path(self) -> Path:
         return self.root / "presets.json"
+
+    def whisper_models_dir(self) -> Path:
+        """Whisper 模型下载落点；配置里指定了就跟随，否则用 <companion>/whisper-models。"""
+        custom = str(self.get("companion_whisper_download_dir", "") or "").strip()
+        if custom:
+            path = Path(custom).expanduser()
+        else:
+            path = self.root / "whisper-models"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def library_dir(self, category: str) -> Path:
         key = f"companion_lib_{category}"
