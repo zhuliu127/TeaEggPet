@@ -99,11 +99,12 @@ DEFAULTS: dict[str, Any] = {
     "companion_tts_text_lang": "zh",
     "companion_tts_prompt_lang": "zh",
     "companion_tts_speed": 1.0,
-    # ---- 语音助手（本地 Whisper 麦克风听写 + 唤醒词）----
+    # ---- 语音助手（推挽式：按住语音键说话 → 松开识别 → 进对话）----
     "companion_voice_enabled": False,          # 总开关
-    "companion_voice_wake_word": "小鱼小鱼",   # 唤醒词
-    "companion_voice_sleep_word": "休息一下",  # 结束词
-    "companion_voice_dialog_timeout": 60,      # 对话模式空闲多少秒自动退出（0=不超时）
+    "companion_voice_hotkey": "win+alt",        # 语音键（按住说话，默认 Win+Alt；可改）
+    "companion_voice_wake_word": "",           # 旧字段：唤醒词（已弃用，保留兼容旧配置）
+    "companion_voice_sleep_word": "",          # 旧字段：结束词（已弃用，保留兼容旧配置）
+    "companion_voice_dialog_timeout": 60,      # 旧字段：对话空闲超时（推挽式不再使用）
     "companion_voice_device": "",              # 麦克风设备名（空=系统默认）
     # Whisper 模型
     "companion_whisper_model_size": "base",    # 对话整合转写用的模型档位 tiny/base/small/medium/large-v3
