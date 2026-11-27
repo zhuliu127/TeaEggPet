@@ -268,14 +268,15 @@ def test_is_muted_during_tts_mute_window():
     assert a._is_muted() is False
 
 
-def test_busy_reply_mutes_then_deadline_clears():
-    """AI 回复忙碌时静音；兜底超时后自动解除，不会永久静音。"""
+def test_busy_reply_does_not_mute_mic():
+    """AI 生成（等回复）期间**不静音麦克风**：否则用户等回复的十几秒里说什么都没反应、
+    连结束词都叫不动（用户实测 bug）。_busy_reply 只用于防重复提交，不参与采集静音。"""
     import time
     a = _make({})
     a._busy_reply = True
     a._busy_deadline = time.time() + 10.0
-    assert a._is_muted() is True
-    # 超时后
+    assert a._is_muted() is False          # 关键：等她回复时不堵麦克风
+    # 兜底超时后标志自动清掉
     a._busy_deadline = time.time() - 1.0
     assert a._is_muted() is False
     assert a._busy_reply is False  # 被超时清掉

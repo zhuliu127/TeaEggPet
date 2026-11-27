@@ -366,14 +366,20 @@ class VoiceAssistant(QObject):
             pass
 
     def _on_chat_finished(self, user_text: str = "", reply: str = "") -> None:
-        """AI 回复完成（GUI 线程回调）：解除忙碌，把回复显示成气泡。"""
+        """AI 回复完成（GUI 线程回调）：解除忙碌，把回复显示成气泡。
+
+        注意：``ChatService._finished`` 是 ``cb(finished_text)`` 这样只传一个位置参数
+        （那是**回复正文**），并不是 ``(user_text, reply)``。所以要兼容两种来源：
+        把「第一个非空参数」当作回复正文，避免回复被吞掉、气泡永远不显示。
+        """
         self._busy_reply = False
+        text = str(reply or "").strip() or str(user_text or "").strip()
         # 只有语音对话进行中才把回复冒成气泡（避免干扰手动聊天的界面）
-        if self._state in ("dialog", "confirm") and reply:
+        if self._state in ("dialog", "confirm") and text:
             try:
                 from . import runtime as rt
 
-                rt.bubble(str(reply), 8000)
+                rt.bubble(text, 8000)
             except Exception:  # noqa: BLE001
                 log.debug("显示回复气泡失败", exc_info=True)
 
@@ -814,8 +820,12 @@ class VoiceAssistant(QObject):
 
         # 对话 / 确认模式：完整转写
         self._last_active = time.time()
+        # 采集循环里已经做过能量+过零率+有声帧占比三重门控、也用 Silero 精修过，
+        # 这里**不再用 whisper 内部 vad_filter**——它偶发把整段话判成「无语音活动」
+        # 而整段返回空（日志「VAD filter removed 00:00.000」后无任何 heard），
+        # 导致用户说了话却「没有任何回应」。关掉它，交给前面已过滤好的音频。
         text = asr.transcribe(self._engine, audio, language="zh",
-                              vad_filter=True, beam_size=int(self._cfg("companion_whisper_beam", 1) or 1))
+                              vad_filter=False, beam_size=int(self._cfg("companion_whisper_beam", 1) or 1))
         self.heard.emit(text)
         if not text.strip():
             return
@@ -1001,10 +1011,15 @@ class VoiceAssistant(QObject):
 
     # ------------------------------------------------------------ 发进对话
     def _send_to_chat(self, text: str) -> None:
-        # 从这刻起她在「忙」：AI 生成 + 朗读回复期间采集端静音，避免把环境音
-        # 或她自己念回复的声音当成用户下一条。回复完成回调会清掉这个标志。
+        # 已在等上一条回复时，不重复提交（但麦克风仍继续听，用户可以说完再等）。
+        # _is_muted() 会在 _busy_deadline 到点时自愈清掉这个标志，这里再判一次。
+        if self._busy_reply and time.time() < self._busy_deadline:
+            log.info("上一条回复尚未完成，跳过这条的重复提交：%r", text)
+            return
+        # 从这刻起她在「忙」：只用于「防重复提交同一句」，**不再用于静音麦克风**
+        # （静音只由 TTS 实际播放窗口决定，见 _is_muted）。
         self._busy_reply = True
-        self._busy_deadline = time.time() + 25.0
+        self._busy_deadline = time.time() + 10.0
         self._last_active = time.time()
 
         def _go():
@@ -1127,7 +1142,9 @@ class VoiceAssistant(QObject):
         3) 全局 TTS busy：**只在上面两个窗口之内**才采信，避免被外部卡死的 busy 拖死。
         """
         now = time.time()
-        # 回复忙碌硬超时：回调没来也不超过 25 秒
+        # 回复忙碌硬超时：回调没来也不超过 10 秒（原 25s 太长，AI 若生成失败/慢，
+        # 麦克风会被堵死一整段，用户说什么都「没回应」，连「休息一下」也叫不动。
+        # 现在只当「别把同一句重复提交」用，且很快自愈。）
         if self._busy_reply and self._busy_deadline and now > self._busy_deadline:
             self._busy_reply = False
         # 静音窗口兜底上限（防止 _mute_until 因异常被设得离谱）
@@ -1135,9 +1152,13 @@ class VoiceAssistant(QObject):
             self._mute_until = 0.0
 
         in_own_window = now < self._mute_until
-        # 只在我们自己确知她在出声的窗口内静音；窗口之外一律不静音，
-        # 确保麦克风永远能听到用户（历史上被卡死的全局 busy 拖死过）。
-        return bool(in_own_window or self._busy_reply)
+        # **只在我们确知她真的在出声（我们自己设定的 _mute_until 静音窗口）时静音麦克风。**
+        # 绝不再采信全局 TTS 的 ``busy``——那是外部状态，本地 TTS 服务断开/合成线程
+        # 卡死时 busy 会**永久 True**，采集端就会整屏「（她正在说话，已静音采集）」，
+        # 用户说什么都没反应（实测日志：唤醒后 22 秒连续静音采集，rms 全是 0.0000）。
+        # _busy_reply 也只用于防重复提交，不参与静音判断（等回复期间麦克风照听）。
+        # _mute_until 由 _do_speak 按字数估算且封顶 8 秒，且有 +30s 兜底清零，绝不会永久静音。
+        return bool(in_own_window)
 
 
     # ------------------------------------------------------------ 状态
