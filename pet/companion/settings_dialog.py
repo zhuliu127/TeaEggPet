@@ -909,9 +909,26 @@ class CompanionSettingsDialog(QDialog):
         self.voice_device.setToolTip("选输入设备（麦克风）。系统默认通常就行")
         btn_dev = QPushButton("刷新设备")
         btn_dev.clicked.connect(self._refresh_voice_devices)
+        self.voice_test_btn = QPushButton("测试麦克风")
+        self.voice_test_btn.setToolTip("录 3 秒，看这个麦克风到底能不能正常收音（对着它说话）")
+        self.voice_test_btn.clicked.connect(self._test_voice_device)
         row.addWidget(self.voice_device, 1)
         row.addWidget(btn_dev)
+        row.addWidget(self.voice_test_btn)
         form.addRow("麦克风", self._wrap(row))
+
+        # 麦克风测试：实时电平条 + 结果文字
+        self.voice_meter = QProgressBar()
+        self.voice_meter.setRange(0, 100)
+        self.voice_meter.setValue(0)
+        self.voice_meter.setTextVisible(False)
+        self.voice_meter.setFixedHeight(10)
+        self.voice_meter.setVisible(False)
+        self.voice_test_label = QLabel("")
+        self.voice_test_label.setWordWrap(True)
+        self.voice_test_label.setVisible(False)
+        form.addRow("", self.voice_meter)
+        form.addRow("", self.voice_test_label)
 
         self.voice_timeout = QSpinBox()
         self.voice_timeout.setRange(0, 600)
@@ -1023,6 +1040,51 @@ class CompanionSettingsDialog(QDialog):
         idx = self.voice_device.findData(current)
         if idx >= 0:
             self.voice_device.setCurrentIndex(idx)
+
+    def _test_voice_device(self) -> None:
+        """录音 3 秒测麦克风能不能正常收音，实时显示电平条。"""
+        from . import voice_assistant as va
+
+        if getattr(self, "_mic_testing", False):
+            return
+        name = self.voice_device.currentData() or self.voice_device.currentText().strip()
+        self._mic_testing = True
+        self.voice_test_btn.setEnabled(False)
+        self.voice_meter.setVisible(True)
+        self.voice_test_label.setVisible(True)
+        self.voice_meter.setValue(0)
+        self.voice_test_label.setText(f"正在录音 3 秒…请对着「{name or '系统默认麦克风'}」说句话")
+
+        def _on_level(rms: float) -> None:
+            # 把 rms 映射到 0~100 进度条（rms 0.5 约等于满格，够直观）
+            pct = int(max(0, min(100, round(rms / 0.5 * 100))))
+            self._bridge.post(lambda: self.voice_meter.setValue(pct))
+
+        def _run():
+            return va.probe_mic(name, seconds=3.0, on_level=_on_level)
+
+        def _done(res: dict) -> None:
+            self._mic_testing = False
+            self.voice_test_btn.setEnabled(True)
+            ok = bool(res.get("ok"))
+            if ok:
+                self.voice_meter.setValue(100)
+                self.voice_test_label.setText(
+                    f"✅ 麦克风正常！峰值 {res.get('peak', 0):.3f}，平均 {res.get('rms', 0):.3f}"
+                    f"（设备 {res.get('device')}，{res.get('sr')}Hz）")
+            else:
+                self.voice_meter.setValue(0)
+                self.voice_test_label.setText(
+                    f"❌ 没检测到声音：{res.get('error') or '麦克风几乎没电平'}"
+                    "。请确认没静音、选对了麦克风，或在 Windows 声音设置里启用它。")
+
+        def _bad(msg) -> None:
+            self._mic_testing = False
+            self.voice_test_btn.setEnabled(True)
+            self.voice_meter.setValue(0)
+            self.voice_test_label.setText(f"测试失败：{msg}")
+
+        self._run_task(_run, _done, self.voice_test_btn, _bad)
 
     def _pick_whisper_path(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "选择 Whisper 模型目录", self.whisper_path.text().strip() or "")

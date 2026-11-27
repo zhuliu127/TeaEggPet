@@ -240,6 +240,21 @@ class WalkService(QObject):
         """回家动画（默认「漂浮踏步」）。"""
         self._play_clip(self._enter_clip_name(), "回家")
 
+    def greet_animation(self) -> bool:
+        """被唤醒时做一个打招呼的小动作（不改溜达状态，只播一段动画）。
+
+        优先挑轻盈的「漂浮/踏步/挥手/开心」类动作；挑不到就退回当前可播的
+        第一个动作。没有可播动画的宿主时返回 False（调用方只走语音/气泡）。
+        """
+        hints = ("挥手", "打招呼", "开心", "笑", "舞蹈", "跳", "wave", "hello",
+                 "漂浮", "踏步", "飘", "float") + _ENTER_HINTS
+        name = self._clip_name_for(hints) or self._run_clip_name()
+        if not name:
+            log.info("播放唤醒动画：角色包没有可用动作素材，跳过")
+            return False
+        self._play_clip(name, "唤醒")
+        return True
+
     def _run_anim_ms(self, fallback: int, *, factor: float = 1.25,
                      cap: int = _ANIM_MAX_MS, floor: int = _ANIM_MIN_MS,
                      name: str = "") -> int:

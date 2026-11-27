@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """语音助手纯逻辑测试：无麦克风、不加载模型、不起 Qt 事件循环。
 
 只测「不用硬件/模型就能验证」的那部分：文本归一化、关键词匹配、唤醒词模糊匹配、
@@ -211,4 +211,47 @@ def test_load_models_reports_error_when_no_model(monkeypatch):
     a.error.connect(lambda m: errs.append(m))
     assert a._load_models() is False
     assert errs, "应发出 error 信号"
+
+
+def test_candidate_devices_prefers_wasapi_and_puts_mme_last(monkeypatch):
+    """同名麦克风跨 host API 重复时：WASAPI 候选优先、MME 靠后。"""
+    import sys
+
+    devices = [
+        {"name": "扬声器 (X)", "max_input_channels": 0, "hostapi": 1},          # 非输入，忽略
+        {"name": "麦克风 (BOYA CastMic G30)", "max_input_channels": 1, "hostapi": 0},  # MME
+        {"name": "麦克风 (BOYA CastMic G30)", "max_input_channels": 2, "hostapi": 2},  # WASAPI
+    ]
+    hostapis = [{"name": "MME"}, {"name": "Output"}, {"name": "Windows WASAPI"}]
+    fake_sd = types.SimpleNamespace(
+        query_devices=lambda: devices, query_hostapis=lambda: hostapis)
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+    a = _make({"companion_voice_device": "麦克风 (BOYA CastMic G30)"})
+    cands = a._candidate_devices()
+    assert cands[0] == 2, "WASAPI 应排第一"
+    assert cands[-1] == 1, "MME 应排最后"
+    assert 0 not in cands, "非输入设备不应进入候选"
+
+
+def test_candidate_devices_empty_name_is_default(monkeypatch):
+    import sys
+
+    fake_sd = types.SimpleNamespace(query_devices=lambda: [], query_hostapis=lambda: [])
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+    a = _make({"companion_voice_device": ""})
+    assert a._candidate_devices() == [None]
+
+
+def test_list_input_devices_only_inputs(monkeypatch):
+    import sys
+
+    devices = [
+        {"name": "扬声器", "max_input_channels": 0},
+        {"name": "麦克风 A", "max_input_channels": 2},
+    ]
+    fake_sd = types.SimpleNamespace(query_devices=lambda: devices)
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+    out = va.list_input_devices()
+    assert out == [(1, "麦克风 A", 2)]
+
 

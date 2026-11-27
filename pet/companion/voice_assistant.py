@@ -72,6 +72,100 @@ class VoiceAssistantError(RuntimeError):
     pass
 
 
+def list_input_devices() -> list[tuple[int, str, int]]:
+    """返回所有输入设备 [(序号, 设备名, 输入声道数)]，供设置页下拉/测试用。"""
+    out: list[tuple[int, str, int]] = []
+    try:
+        import sounddevice as sd
+
+        for idx, dev in enumerate(sd.query_devices()):
+            if int(dev.get("max_input_channels", 0)) > 0:
+                out.append((idx, str(dev.get("name", "")), int(dev.get("max_input_channels", 0))))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def probe_mic(device_name: str = "", seconds: float = 3.0, on_level=None) -> dict:
+    """测试某个麦克风能否正常收音。
+
+    返回 {"ok":bool, "rms":float, "peak":float, "sr":int, "device":int|None, "error":str}。
+    ``on_level`` 每次收到一小段会回调 rms（用于界面实时波形/音量条）。
+    会自动按设备默认采样率打开（USB 麦常不支持 16000Hz），并挑选同名设备里
+    真正有电平的 WASAPI 端点。
+    """
+    import numpy as np
+
+    result = {"ok": False, "rms": 0.0, "peak": 0.0, "sr": SAMPLE_RATE, "device": None, "error": ""}
+    try:
+        import sounddevice as sd
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = f"没有 sounddevice：{exc}"
+        return result
+
+    # 选出候选设备序号
+    candidates: list[int] = []
+    name = str(device_name or "").strip()
+    if name:
+        try:
+            hostapis = sd.query_hostapis()
+        except Exception:  # noqa: BLE001
+            hostapis = []
+        hits = []
+        for idx, dev in enumerate(sd.query_devices()):
+            if int(dev.get("max_input_channels", 0)) > 0 and name in str(dev.get("name", "")):
+                try:
+                    api = str(hostapis[dev.get("hostapi", -1)].get("name", ""))
+                except Exception:  # noqa: BLE001
+                    api = ""
+                hits.append((idx, api, int(dev.get("max_input_channels", 0))))
+        hits.sort(key=lambda t: (1 if "WASAPI" in t[1].upper() else 0,
+                                 0 if "MME" in t[1].upper() else 1, t[2], t[0]), reverse=True)
+        candidates = [h[0] for h in hits]
+    if not candidates:
+        candidates = [None]  # 系统默认
+
+    total_best = -1.0
+    for dev in candidates:
+        try:
+            info = sd.query_devices(dev) if dev is not None else sd.query_devices(kind="input")
+            sr = int(info.get("default_samplerate") or SAMPLE_RATE)
+        except Exception:  # noqa: BLE001
+            sr = SAMPLE_RATE
+        block = max(1, int(sr * 0.05))
+        try:
+            peak = 0.0
+            acc: list[float] = []
+            with sd.InputStream(samplerate=sr, channels=1, dtype="float32",
+                                blocksize=block, device=dev) as stream:
+                need = int(seconds * sr / block)
+                for _ in range(max(1, need)):
+                    data, _ov = stream.read(block)
+                    x = data[:, 0] if data.ndim > 1 else data
+                    rms = float(np.sqrt(np.mean(x.astype(np.float32) ** 2)) + 1e-12)
+                    peak = max(peak, float(np.max(np.abs(x))) if x.size else 0.0)
+                    acc.append(rms)
+                    if on_level:
+                        try:
+                            on_level(rms)
+                        except Exception:  # noqa: BLE001
+                            pass
+            mean_rms = float(np.mean(acc)) if acc else 0.0
+            if mean_rms > total_best:
+                total_best = mean_rms
+                result.update({"ok": mean_rms > 0.001 or peak > 0.02, "rms": mean_rms,
+                               "peak": peak, "sr": sr, "device": dev, "error": ""})
+            if result["ok"]:
+                break
+        except Exception as exc:  # noqa: BLE001
+            if not result["error"]:
+                result["error"] = f"打开设备 {dev} 失败：{exc}"
+            continue
+    if not result["ok"] and not result["error"]:
+        result["error"] = "麦克风几乎没有声音（rms≈0），请检查是否静音、选错设备或在系统里禁用了"
+    return result
+
+
 class VoiceAssistant(QObject):
     """麦克风语音助手（单例由 runtime 持有）。"""
 
@@ -196,20 +290,48 @@ class VoiceAssistant(QObject):
             pass
         return ""
 
-    def _resolve_device(self) -> int | None:
-        """按配置的麦克风名找设备序号；空/找不到走系统默认。"""
+    def _candidate_devices(self) -> list[int | None]:
+        """按配置的麦克风名找出候选设备序号（按优先级排序）。
+
+        **关键**：同名麦克风在 Windows 上常被不同 host API 暴露成多个设备序号
+        （MME/DirectSound/WASAPI/WDM-KS…）。其中 MME 那个经常「能开但永远是静音」，
+        WASAPI 才有真电平但偶尔会抛 AUDCLNT_E_OUT_OF_ORDER，WDM-KS 不支持阻塞读。
+        旧代码取第一个子串命中，正好命中那个永远静音的 MME 端点 → 录到永远是 0，
+        唤醒词自然识别不出来。这里返回**全部同名候选**（WASAPI 优先、MME 靠后），
+        由 _run 逐个尝试、哪个能开且能读就先用哪个。名字为空/找不到 → [None] 走默认。
+        """
         name = str(self._cfg("companion_voice_device", "") or "").strip()
         if not name:
-            return None
+            return [None]
         try:
             import sounddevice as sd
 
+            try:
+                hostapis = sd.query_hostapis()
+            except Exception:  # noqa: BLE001
+                hostapis = []
+            hits: list[tuple[int, str, int]] = []
             for idx, dev in enumerate(sd.query_devices()):
-                if dev.get("max_input_channels", 0) > 0 and name in str(dev.get("name", "")):
-                    return idx
+                if int(dev.get("max_input_channels", 0)) > 0 and name in str(dev.get("name", "")):
+                    try:
+                        api = str(hostapis[dev.get("hostapi", -1)].get("name", ""))
+                    except Exception:  # noqa: BLE001
+                        api = ""
+                    hits.append((idx, api, int(dev.get("max_input_channels", 0))))
+            if not hits:
+                return [None]
+            hits.sort(key=lambda t: (1 if "WASAPI" in t[1].upper() else 0,
+                                     0 if "MME" in t[1].upper() else 1, t[2], t[0]), reverse=True)
+            log.info("麦克风同名设备 %d 个，候选序号=%s", len(hits), [h[0] for h in hits])
+            return [h[0] for h in hits]
         except Exception:  # noqa: BLE001
             pass
-        return None
+        return [None]
+
+    def _resolve_device(self) -> int | None:
+        """兼容旧接口：返回首选设备序号。"""
+        cands = self._candidate_devices()
+        return cands[0] if cands else None
 
     def stop(self) -> None:
         """请求停止。**不 join**（避免在 GUI 主线程上阻塞），后台线程看到
@@ -282,16 +404,47 @@ class VoiceAssistant(QObject):
         energy_threshold = 0.004
         noise_floor = 0.0
         last_level_log = 0.0
-        try:
-            self._stream = sd.InputStream(
-                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                blocksize=BLOCK, device=self._device_index,
+        # 采集采样率：很多 USB 麦克风/虚拟声卡不支持 16000Hz（强行给 16000 会
+        # 报 Invalid sample rate -9997 直接开流失败）。这里按设备自身默认采样率
+        # 打开，再在每个块上就近重采样到 SAMPLE_RATE(16000) 交给 VAD/whisper。
+        def _open_stream(dev):
+            dvinfo = sd.query_devices(dev) if dev is not None else sd.query_devices(kind="input")
+            sr = int(dvinfo.get("default_samplerate") or SAMPLE_RATE)
+            stream = sd.InputStream(
+                samplerate=sr, channels=1, dtype="float32",
+                blocksize=max(1, int(sr * BLOCK_MS / 1000)), device=dev,
             )
-            self._stream.start()
-            log.info("麦克风已打开：device=%s samplerate=%d", self._device_index, SAMPLE_RATE)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("打开麦克风失败")
-            self.error.emit(f"打不开麦克风：{exc}")
+            stream.start()
+            # 试读一小段：WASAPI 常见的 AUDCLNT_E_OUT_OF_ORDER 往往在首读才暴雷，
+            # 这里先探一下，坏就丢弃换下一个候选。
+            stream.read(max(1, int(sr * BLOCK_MS / 1000)))
+            return stream, sr
+
+        candidates = self._candidate_devices()
+        self._stream = None
+        capture_sr = SAMPLE_RATE
+        open_err = ""
+        for dev in candidates:
+            if self._stop.is_set():
+                break
+            try:
+                self._stream, capture_sr = _open_stream(dev)
+                self._device_index = dev
+                log.info("麦克风已打开：device=%s samplerate=%d", dev, capture_sr)
+                break
+            except Exception as exc:  # noqa: BLE001
+                open_err = str(exc)
+                log.warning("打开设备 %s 失败，尝试下一个候选：%s", dev, exc)
+                try:
+                    if self._stream is not None:
+                        self._stream.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._stream = None
+                continue
+        if self._stream is None:
+            log.warning("所有麦克风候选都打不开：%s", open_err)
+            self.error.emit(f"打不开麦克风：{open_err or '没有可用输入设备'}")
             self._set_state("off")
             self._thread = None
             if getattr(self, "_restart_pending", False):
@@ -302,16 +455,44 @@ class VoiceAssistant(QObject):
                     pass
             return
 
+        capture_block = max(1, int(capture_sr * BLOCK_MS / 1000))
+
+        def _resample_to_16k(x):
+            n = x.shape[0]
+            need = int(round(n * SAMPLE_RATE / capture_sr))
+            if need <= 0:
+                return np.zeros(0, dtype=np.float32)
+            src = np.linspace(0.0, 1.0, n, endpoint=False, dtype=np.float32)
+            dst = np.linspace(0.0, 1.0, need, endpoint=False, dtype=np.float32)
+            return np.interp(dst, src, x).astype(np.float32)
+
+        read_fail = 0
         try:
             while not self._stop.is_set():
                 try:
-                    data, overflowed = self._stream.read(BLOCK)
+                    data, overflowed = self._stream.read(capture_block)
+                    read_fail = 0
                 except Exception:  # noqa: BLE001
-                    log.exception("读取麦克风失败")
-                    break
-                chunk = data[:, 0].copy() if data.ndim > 1 else data.copy()
+                    read_fail += 1
+                    log.warning("读取麦克风失败（第 %d 次）", read_fail)
+                    if read_fail >= 5:
+                        log.exception("连续读取麦克风失败，退出")
+                        break
+                    # 尝试重开当前流（WASAPI 偶发 OUT_OF_ORDER，重开可恢复）
+                    try:
+                        self._stream.stop(); self._stream.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        self._stream, capture_sr = _open_stream(self._device_index)
+                        capture_block = max(1, int(capture_sr * BLOCK_MS / 1000))
+                    except Exception:  # noqa: BLE001
+                        time.sleep(0.3)
+                    continue
+                raw = data[:, 0].copy() if data.ndim > 1 else data.copy()
+                chunk = _resample_to_16k(raw) if capture_sr != SAMPLE_RATE else raw.astype(np.float32)
                 buffer = np.concatenate([buffer, chunk])
-                rms = float(np.sqrt(np.mean(chunk ** 2)) + 1e-9)
+                rms = float(np.sqrt(np.mean(raw ** 2)) + 1e-9)
 
                 # 自适应门限：把底噪推高到当前 RMS 的平滑值，门限 = 底噪 * 3 且不小于 0.003
                 if rms < energy_threshold:
@@ -442,8 +623,32 @@ class VoiceAssistant(QObject):
         self._last_active = time.time()
         self._set_state("dialog")
         self.woke.emit()
-        self._say("嗯，我在听～")
+        self._greet()
         self.status.emit("已唤醒，正在对话中（说「%s」结束）" % self._sleep_word())
+
+    def _greet(self) -> None:
+        """被唤醒的正反馈：说一段打招呼的话 + 让桌宠做一个动画动作。"""
+        import random
+
+        lines = (
+            "嗯，我在听～",
+            "诶？叫我啦，我在～",
+            "来啦来啦，想聊点什么呀？",
+            "在呢在呢，你说～",
+        )
+        self._say(random.choice(lines))
+
+        def _anim():
+            try:
+                from . import runtime
+
+                svc = runtime.service()
+                if svc is not None and hasattr(svc, "greet_animation"):
+                    svc.greet_animation()
+            except Exception:  # noqa: BLE001
+                log.debug("语音唤醒动画失败", exc_info=True)
+
+        QTimer.singleShot(0, _anim)
 
     def _exit_dialog(self, reason: str = "") -> None:
         self._pending_selfie = False
