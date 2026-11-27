@@ -5488,7 +5488,46 @@ def _configure_linux_fcitx_input_method() -> None:
 PetApp = AppShell
 
 
+def _install_windowed_stdio_guard() -> None:
+    """windowed（PyInstaller console=False）下 sys.stdout/sys.stderr 为 None。
+
+    任何第三方库往 stdout/stderr 写东西（例如 huggingface_hub 下载时 tqdm 画
+    进度条）都会 ``'NoneType' object has no attribute 'write'`` 直接崩溃 ——
+    这正是「下载 small 模型失败」的元凶之一。这里装一个丢弃写入的空流兜底，
+    让这些库照常工作、不崩。
+    """
+    import io
+
+    class _NullStream(io.TextIOBase):
+        def write(self, s):  # noqa: D401
+            try:
+                # 顺手把内容喂给真正的日志，方便排查，但不依赖它有
+                if s and str(s).strip():
+                    logging.debug("[stdio] %s", str(s).rstrip())
+            except Exception:  # noqa: BLE001
+                pass
+            return len(s) if s else 0
+
+        def flush(self):
+            pass
+
+        def isatty(self):
+            return False
+
+        def writable(self):
+            return True
+
+    try:
+        if sys.stdout is None:
+            sys.stdout = _NullStream()
+        if sys.stderr is None:
+            sys.stderr = _NullStream()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main(argv: list[str] | None = None, enable_chat: bool = True) -> int:
+    _install_windowed_stdio_guard()
     _default_xcb_platform_on_wayland()
     # 必须在 QApplication 构造前设置，Qt 才会按随包 Fcitx 插件创建输入法上下文。
     _configure_linux_fcitx_input_method()

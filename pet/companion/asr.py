@@ -60,10 +60,62 @@ def repo_id_of(size: str) -> str:
 # ---------------------------------------------------------------- 下载
 
 def _hf_hub_modules():
-    """延迟导入 huggingface_hub（只在真正要下载时才用）。"""
+    """延迟导入 huggingface_hub（只在真正要下载时才用）。
+
+    注意：huggingface_hub 在 **import 时** 就把环境变量 ``HF_ENDPOINT`` 读进
+    ``constants.ENDPOINT``，之后再改 env 不生效。所以调用方必须在真正 import
+    之前把 env 设好（见 download_model），并额外把 ``endpoint=`` 显式传下去双保险。
+    """
     from huggingface_hub import snapshot_download  # type: ignore
 
     return snapshot_download
+
+
+def _disabled_tqdm(total=None, *args, **kwargs):
+    """返回一个「禁用」的 tqdm 实例（不画任何东西，也不碰 sys.stderr）。
+
+    windowed（console=False）的 PyInstaller 程序里 ``sys.stderr`` 是 ``None``，
+    huggingface_hub 下载时若画进度条会往 stderr 写 →
+    ``'NoneType' object has no attribute 'write'`` 直接崩，模型下不下来。
+    这里用一个真正的 tqdm 子类实例但 ``disable=True``——API 齐全（set_description_str
+    等都要有），写入全丢弃，彻底不碰 stderr。
+    """
+    try:
+        from tqdm.auto import tqdm as _tqdm  # type: ignore
+
+        return _tqdm(total=total, *args, disable=True, **kwargs)
+    except Exception:  # noqa: BLE001
+        # 连 tqdm 都没有：返回一个最简空壳（hub 需要的基础方法都实现）
+        class _Null:
+            def __init__(self, *a, **k):
+                self.n = 0
+                self.total = total
+
+            def update(self, *a, **k):
+                pass
+
+            def close(self):
+                pass
+
+            def set_description(self, *a, **k):
+                pass
+
+            def set_description_str(self, *a, **k):
+                pass
+
+            def set_postfix(self, *a, **k):
+                pass
+
+            def set_postfix_str(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *e):
+                return False
+
+        return _Null()
 
 
 def download_model(
@@ -80,16 +132,9 @@ def download_model(
     """
     if size not in _VALID_SIZES:
         raise ValueError(f"不支持的模型大小：{size}（可选：{'/'.join(_VALID_SIZES)}）")
-    snapshot_download = _hf_hub_modules()
     dest_root = Path(dest_root).expanduser()
     target = dest_root / size
     target.mkdir(parents=True, exist_ok=True)
-
-    # 临时把端点指到镜像；snapshot_download 内部用 SESSION 读环境变量
-    old_endpoint = os.environ.get("HF_ENDPOINT")
-    os.environ["HF_ENDPOINT"] = HF_MIRROR
-    # 关掉软链接警告噪音（Windows 无开发者模式时会刷一屏）
-    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
     def _emit(msg: str) -> None:
         if on_progress is not None:
@@ -98,20 +143,56 @@ def download_model(
             except Exception:  # noqa: BLE001
                 pass
 
+    def _is_cancelled() -> bool:
+        return cancel is not None and cancel.is_set()
+
+    # —— 关键：在 import huggingface_hub 之前就把 env 设好 ——
+    # 1) 端点指到国内镜像（constants.ENDPOINT 在 import 时读取）
+    # 2) 关掉进度条（windowed 下 sys.stderr 是 None，tqdm 写它会崩）
+    # 3) 关软链接警告噪音
+    saved_env = {}
+    for _k in ("HF_ENDPOINT", "HF_HUB_DISABLE_PROGRESS_BARS", "HF_HUB_DISABLE_SYMLINKS_WARNING",
+               "HF_HUB_DISABLE_TELEMETRY"):
+        saved_env[_k] = os.environ.get(_k)
+    os.environ["HF_ENDPOINT"] = HF_MIRROR
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
     _emit(f"正在从国内镜像下载 {size} 模型…（{model_label(size)}）")
+    last_exc: Exception | None = None
     try:
-        # allow_patterns 只拉 CTranslate2 需要的文件，避免下 README/.git 之类
-        snapshot_download(
-            repo_id=repo_id_of(size),
-            local_dir=str(target),
-            allow_patterns=["*.bin", "*.json", "*.txt", "*.model"],
-            max_workers=4,
-        )
+        snapshot_download = _hf_hub_modules()
+        # 先走国内镜像；万一镜像不可用，再退回官方站兜底（不用用户管）
+        for endpoint in (HF_MIRROR, "https://huggingface.co"):
+            if _is_cancelled():
+                _emit("下载已取消")
+                return str(target)
+            try:
+                # allow_patterns 只拉 CTranslate2 需要的文件，避免下 README/.git 之类
+                snapshot_download(
+                    repo_id=repo_id_of(size),
+                    local_dir=str(target),
+                    allow_patterns=["*.bin", "*.json", "*.txt", "*.model"],
+                    max_workers=4,
+                    endpoint=endpoint,
+                    tqdm_class=_disabled_tqdm,
+                )
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                log.warning("从 %s 下载 %s 失败：%s", endpoint, size, exc)
+                continue
     finally:
-        if old_endpoint is None:
-            os.environ.pop("HF_ENDPOINT", None)
-        else:
-            os.environ["HF_ENDPOINT"] = old_endpoint
+        for _k, _v in saved_env.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+
+    if last_exc is not None:
+        raise RuntimeError(f"下载 {size} 模型失败（镜像与官方站均不可用）：{last_exc}")
 
     if cancel is not None and cancel.is_set():
         _emit("下载已取消")
@@ -209,16 +290,71 @@ def load_engine(model_path: str, *, device: str = "cpu", compute_type: str = "in
 
     model_path 可以是本地目录，也可以是 tiny/base 这类 size 名（会自动走
     huggingface_hub 缓存/镜像下载，但正常情况下我们要求传本地目录）。
+
+    **设备自动降级**：若用户选了 CUDA（或 compute 要求 GPU）但本机缺
+    cublas64_12.dll / cudart 等 CUDA 运行库，构造模型不会立刻报错，而是等到
+    第一次 encode 才抛 ``RuntimeError: Library cublas64_12.dll is not found or
+    cannot be loaded`` —— 结果就是「每次都转写失败、唤醒词永远认不出」。
+    这里在 GPU 加载失败时**自动回退到 CPU(int8)**，保证语音一定能用，绝不让
+    一个装不起来的设备把整个语音助手拖死。
     """
+    device = (device or "cpu").strip().lower()
     key = f"{model_path}|{device}|{compute_type}"
     with _engine_lock:
         if key in _engine_cache:
             return _engine_cache[key]
         from faster_whisper import WhisperModel  # type: ignore
 
-        engine = WhisperModel(model_path, device=device, compute_type=compute_type)
+        def _make(dev: str, ctype: str):
+            return WhisperModel(model_path, device=dev, compute_type=ctype)
+
+        engine = None
+        if device != "cpu":
+            try:
+                # 先用极短音频跑一次 encode 真正探活：缺 CUDA 库时构造不报、
+                # encode 才报，所以必须预跑一次，否则坏引擎会缓存下来。
+                cand = _make(device, compute_type)
+                _probe_encode(cand)
+                engine = cand
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "WhisperModel 以 %s/%s 加载失败，自动回退 CPU/int8：%s",
+                    device, compute_type, exc,
+                )
+                try:
+                    from . import runtime as _rt  # noqa: F401  仅用于日志上下文
+
+                    _ = _rt
+                except Exception:  # noqa: BLE001
+                    pass
+                engine = None
+        if engine is None:
+            # CPU 兜底：int8 在 CPU 上足够快（实测 1s 音频 0.01s）
+            if device == "cpu":
+                engine = _make("cpu", compute_type)
+            else:
+                engine = _make("cpu", "int8")
         _engine_cache[key] = engine
         return engine
+
+
+def _probe_encode(engine) -> None:
+    """用 0.2 秒静音喂一次 encode，触发 CUDA 库缺失等懒加载错误。
+
+    成功返回 None；缺库/设备不可用会抛异常（由 load_engine 捕获回退）。
+    """
+    try:
+        import numpy as _np
+    except Exception:  # noqa: BLE001
+        return  # numpy 都没有就跳过探活（正常情况下不可能）
+    silent = _np.zeros(int(0.2 * 16000), dtype=_np.float32)
+    segs, _info = engine.transcribe(
+        silent, language="zh", beam_size=1, vad_filter=False,
+        condition_on_previous_text=False,
+    )
+    # 必须真正消费生成器，encode 才会被执行
+    for _seg in segs:
+        break
 
 
 def unload_engines() -> None:

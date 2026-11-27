@@ -1,6 +1,6 @@
 {
-  "version": "1.4.11",
-  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases",
-  "notes": "TeaEggPet v1.4.11：修「关掉『自拍手臂入镜』后，云端 API 生图仍然举着手机」。上一版只洗了文字，但云端通道不走本地重写、直接拿人物参考图去编辑，而参考图本身就是举手机自拍的姿势，模型会照抄。这一版在关闭开关时：①人物「神态特点」里的『一只手伸向镜头（手机视角）』等姿势描写会被清掉；②提示词末尾追加『参考图姿势不要照搬、画面里不要出现手机/伸向镜头的手臂/自拍杆』的强约束；③参考图说明里明确『参考图里的姿势、表情、视角和背景都不要照搬』。下载见 https://teaeggbiliai.dpdns.org/blog/",
+  "version": "1.4.13",
+  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases/tag/v1.4.13",
+  "notes": "TeaEggPet v1.4.13：修复本地语音唤醒与模型下载两个问题。① 说「小鱼小鱼」没被唤醒：之前语音识别默认可能走了 GPU(CUDA) 加速，但电脑缺 cublas 运行库导致每次识别都悄悄失败——这版一旦发现 GPU 不可用会自动切回 CPU，不再因为装不上的设备把语音功能拖死。② 下载 small/base 等模型提示「下载失败」或卡住：之前下载没真正走国内镜像、又不巧在无控制台窗口里因进度条写空输出流崩溃——这版强制走国内镜像 hf-mirror.com（镜像不通才退回官方站），并关掉会崩溃的进度条渲染，下载稳定。下载见 https://teaeggbiliai.dpdns.org/blog/",
   "assets": {}
 }
