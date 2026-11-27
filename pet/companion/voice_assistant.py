@@ -95,6 +95,7 @@ class VoiceAssistant(QObject):
         self._pending_selfie = False  # 二次确认中
         self._last_active = 0.0       # 最后一次听到说话的时间（对话超时用）
         self._device_index: int | None = None
+        self._restart_pending = False  # 旧线程退出后是否需要自动重启（reload 用）
 
     # ------------------------------------------------------------ 配置读取
     def _store(self):
@@ -120,7 +121,13 @@ class VoiceAssistant(QObject):
 
     # ------------------------------------------------------------ 生命周期
     def start(self) -> bool:
-        """启动监听。返回 True 表示已在跑。失败时不抛，只发 error 信号。"""
+        """启动监听。返回 True 表示已在跑。
+
+        **绝不在调用线程（通常是 GUI 主线程）里加载模型**：Whisper 模型加载、
+        CUDA 探活回退都要好几秒，放在主线程会让整个程序「未响应」——之前用户
+        只要点「应用并重启监听」或保存配置就卡死，根子就在这。现在这里只做
+        轻量检查 + 起后台线程，真正的模型加载在 ``_run`` 里完成，UI 立刻返回。
+        """
         if self._thread is not None and self._thread.is_alive():
             return True
         if not self._enabled():
@@ -131,7 +138,21 @@ class VoiceAssistant(QObject):
         except Exception as exc:  # noqa: BLE001
             self.error.emit(f"缺少音频库 sounddevice：{exc}")
             return False
-        # 主模型
+
+        self._device_index = self._resolve_device()
+        self._stop.clear()
+        self._pending_selfie = False
+        self._last_active = time.time()
+        self._engine = None
+        self._kws_engine = None
+        self._thread = threading.Thread(target=self._run, name="VoiceAssistant", daemon=True)
+        self._thread.start()
+        self._set_state("idle")
+        self.status.emit("语音助手正在启动…（首次加载模型可能要等几秒）")
+        return True
+
+    def _load_models(self) -> bool:
+        """在后台线程里加载主模型 + 唤醒词模型。失败发 error 并返回 False。"""
         from . import asr
 
         model_dir = asr.resolve_model_dir(self._cfg)
@@ -141,32 +162,27 @@ class VoiceAssistant(QObject):
                 "选一个模型点「下载」，或填入已有模型目录。")
             return False
         try:
-            main_size = str(self._cfg("companion_whisper_model_size", "base") or "base")
             device = str(self._cfg("companion_whisper_device", "cpu") or "cpu")
             compute = str(self._cfg("companion_whisper_compute", "int8") or "int8")
             self._engine = asr.load_engine(model_dir, device=device, compute_type=compute)
+            log.info("语音助手主模型已加载：%s（device=%s,%s）", model_dir, device, compute)
             # 唤醒词识别模型：默认 tiny（快）；若用户设了就用它
             kws_path = str(self._cfg("companion_whisper_kws_model_path", "") or "").strip()
             if kws_path:
                 self._kws_engine = asr.load_engine(kws_path, device=device, compute_type=compute)
             else:
-                # 用同一个主引擎也可（只是慢一点）；优先尝试 tiny
                 tiny_dir = self._find_tiny(model_dir)
-                self._kws_engine = asr.load_engine(tiny_dir, device=device, compute_type=compute) if tiny_dir else self._engine
+                if tiny_dir:
+                    self._kws_engine = asr.load_engine(tiny_dir, device=device, compute_type="int8")
+                    log.info("唤醒词模型 tiny：%s", tiny_dir)
+                else:
+                    self._kws_engine = self._engine
+                    log.info("未找到 tiny，唤醒词改用主模型识别")
+            return True
         except Exception as exc:  # noqa: BLE001
             log.exception("加载 Whisper 模型失败")
             self.error.emit(f"加载模型失败：{exc}")
             return False
-
-        self._device_index = self._resolve_device()
-        self._stop.clear()
-        self._pending_selfie = False
-        self._last_active = time.time()
-        self._thread = threading.Thread(target=self._run, name="VoiceAssistant", daemon=True)
-        self._thread.start()
-        self._set_state("idle")
-        self.status.emit("语音助手已开启，说「%s」叫醒我～" % self._wake_word())
-        return True
 
     def _find_tiny(self, fallback_main: str) -> str:
         """找 tiny 模型目录；没有就返回空（用主引擎兜底）。"""
@@ -196,27 +212,59 @@ class VoiceAssistant(QObject):
         return None
 
     def stop(self) -> None:
+        """请求停止。**不 join**（避免在 GUI 主线程上阻塞），后台线程看到
+        ``_stop`` 后会自行关流退出；模型加载中也不影响——加载完会立即发现
+        ``_stop`` 已置位而直接退出。"""
         self._stop.set()
-        th = self._thread
-        if th is not None and th.is_alive():
-            th.join(timeout=3.0)
-        self._thread = None
-        self._stream = None
         self._set_state("off")
 
     def reload(self) -> None:
-        """配置改了之后重来一遍（关着就不动）。"""
-        if self._enabled():
+        """配置改了之后重来一遍（关着就不动）。
+
+        全程不在调用线程上等待：置 _stop 后交给后台线程退出，线程在 finally
+        里发现 ``_restart_pending`` 就通过 QTimer 回到 GUI 线程重新 start()。
+        """
+        if not self._enabled():
+            self._restart_pending = False
             self.stop()
-            QTimer.singleShot(300, self.start)
+            return
+        th = self._thread
+        if th is not None and th.is_alive():
+            # 旧线程还在（可能在加载模型）：标记重启，等它自己退出后再拉起
+            self._restart_pending = True
+            self._stop.set()
+            self._set_state("off")
         else:
-            self.stop()
+            # 没有在跑，直接（非阻塞地）启动
+            self._restart_pending = False
+            self.start()
 
     # ------------------------------------------------------------ 主循环
     def _run(self) -> None:
         import numpy as np
         import sounddevice as sd
         from faster_whisper.vad import get_speech_timestamps, VadOptions
+
+        # 1) 先在后台线程加载模型（这里慢没关系，不卡 UI）
+        self.status.emit("语音助手：正在加载模型…")
+        try:
+            ok = self._load_models()
+        except Exception:  # noqa: BLE001
+            log.exception("加载模型异常")
+            ok = False
+        if not ok or self._stop.is_set():
+            self._set_state("off")
+            self._thread = None
+            if getattr(self, "_restart_pending", False):
+                self._restart_pending = False
+                try:
+                    QTimer.singleShot(300, self.start)
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+
+        self._last_active = time.time()
+        self.status.emit("语音助手已开启，说「%s」叫醒我～" % self._wake_word())
 
         vad_opts = VadOptions(
             threshold=0.5,
@@ -229,16 +277,29 @@ class VoiceAssistant(QObject):
         speaking = False
         silence_limit = int(0.6 / (BLOCK_MS / 1000.0))  # 0.6 秒静音判定一句话结束
         max_seg_sec = 15.0
+
+        # 自适应能量门限：先按一个较低初值，持续跟踪底噪（静音块 RMS 的滑窗分位）
+        energy_threshold = 0.004
+        noise_floor = 0.0
+        last_level_log = 0.0
         try:
             self._stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                 blocksize=BLOCK, device=self._device_index,
             )
             self._stream.start()
+            log.info("麦克风已打开：device=%s samplerate=%d", self._device_index, SAMPLE_RATE)
         except Exception as exc:  # noqa: BLE001
             log.exception("打开麦克风失败")
             self.error.emit(f"打不开麦克风：{exc}")
             self._set_state("off")
+            self._thread = None
+            if getattr(self, "_restart_pending", False):
+                self._restart_pending = False
+                try:
+                    QTimer.singleShot(300, self.start)
+                except Exception:  # noqa: BLE001
+                    pass
             return
 
         try:
@@ -246,19 +307,30 @@ class VoiceAssistant(QObject):
                 try:
                     data, overflowed = self._stream.read(BLOCK)
                 except Exception:  # noqa: BLE001
+                    log.exception("读取麦克风失败")
                     break
                 chunk = data[:, 0].copy() if data.ndim > 1 else data.copy()
                 buffer = np.concatenate([buffer, chunk])
-                # 用简单能量门限累积「可能是话」的段，再用 VAD 精确切
                 rms = float(np.sqrt(np.mean(chunk ** 2)) + 1e-9)
-                speech = rms > 0.006        # 能量门限（挡掉底噪）
+
+                # 自适应门限：把底噪推高到当前 RMS 的平滑值，门限 = 底噪 * 3 且不小于 0.003
+                if rms < energy_threshold:
+                    noise_floor = 0.98 * noise_floor + 0.02 * rms
+                    energy_threshold = max(0.003, min(0.02, noise_floor * 3.0 + 0.002))
+                speech = rms > energy_threshold
+
+                # 每 3 秒打一条电平日志，方便排查「麦克风到底有没有信号」
+                now = time.time()
+                if now - last_level_log > 3.0:
+                    last_level_log = now
+                    log.info("麦克风电平 rms=%.4f 门限=%.4f 状态=%s", rms, energy_threshold, self._state)
+
                 if speech:
                     speaking = True
                     silence_blocks = 0
                 else:
                     if speaking:
                         silence_blocks += 1
-                seg_limit = int(max_seg_sec / (BLOCK_MS / 1000.0))
                 seg_too_long = buffer.shape[0] > int(max_seg_sec * SAMPLE_RATE)
                 seg_done = speaking and silence_blocks >= silence_limit
                 if not (seg_done or seg_too_long):
@@ -291,6 +363,14 @@ class VoiceAssistant(QObject):
             except Exception:  # noqa: BLE001
                 pass
             self._stream = None
+            self._thread = None
+            # reload 请求过重启：回到 GUI 线程重新 start()（含重新读配置）
+            if getattr(self, "_restart_pending", False):
+                self._restart_pending = False
+                try:
+                    QTimer.singleShot(300, self.start)
+                except Exception:  # noqa: BLE001
+                    log.exception("安排语音助手重启失败")
 
     # ------------------------------------------------------------ 状态机
     def _wake_word(self) -> str:

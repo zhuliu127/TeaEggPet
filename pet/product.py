@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """TeaEggPet 自己的版本号（对外版本 / 更新检测基准）。
 
 为什么要跟 ``pet.__version__`` 分开：
@@ -15,4 +15,4 @@ from __future__ import annotations
 from . import __version__ as KERNEL_VERSION
 
 PRODUCT_NAME = 'TeaEggPet'
-PRODUCT_VERSION = '1.4.13'
+PRODUCT_VERSION = '1.4.14'

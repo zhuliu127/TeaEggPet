@@ -1,6 +1,6 @@
 {
-  "version": "1.4.13",
-  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases/tag/v1.4.13",
-  "notes": "TeaEggPet v1.4.13：修复本地语音唤醒与模型下载两个问题。① 说「小鱼小鱼」没被唤醒：之前语音识别默认可能走了 GPU(CUDA) 加速，但电脑缺 cublas 运行库导致每次识别都悄悄失败——这版一旦发现 GPU 不可用会自动切回 CPU，不再因为装不上的设备把语音功能拖死。② 下载 small/base 等模型提示「下载失败」或卡住：之前下载没真正走国内镜像、又不巧在无控制台窗口里因进度条写空输出流崩溃——这版强制走国内镜像 hf-mirror.com（镜像不通才退回官方站），并关掉会崩溃的进度条渲染，下载稳定。下载见 https://teaeggbiliai.dpdns.org/blog/",
+  "version": "1.4.14",
+  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases/tag/v1.4.14",
+  "notes": "TeaEggPet v1.4.14：把语音助手体验又修好了三个地方。① 下载模型时新增进度条：能看到已下载多少、总大小、百分比和实时速度。② 之前设置好语音、说「小鱼小鱼」还是没反应：一是加载模型放在了界面线程里会卡，二是麦克风能量门限写死太高、低增益麦克风永远采不到语音——这版改成后台线程加载模型、门限自适应跟随底噪，普通麦克风也能正常唤醒。③ 顺手修掉了点「应用并重启监听」或保存时整个程序「未响应」卡死的问题（模型加载不再阻塞界面）。下载见 https://teaeggbiliai.dpdns.org/blog/",
   "assets": {}
 }

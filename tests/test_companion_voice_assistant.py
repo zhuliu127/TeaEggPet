@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """语音助手纯逻辑测试：无麦克风、不加载模型、不起 Qt 事件循环。
 
 只测「不用硬件/模型就能验证」的那部分：文本归一化、关键词匹配、唤醒词模糊匹配、
@@ -149,3 +149,66 @@ def test_sleep_word_exits_dialog():
     a._exit_dialog = lambda reason="": a._set_state("idle")  # type: ignore[assignment]
     # 直接调 _handle_segment 太依赖模型；这里验证词表命中即可
     assert va._contains_any("好了休息一下吧", [a._sleep_word()]) == "休息一下"
+
+
+
+# ---------------------------------------------------------------- 非阻塞启动（回归：卡死）
+def test_start_is_nonblocking_when_disabled():
+    """总开关关着时 start() 立即返回 False，不加载模型、不崩。"""
+    a = _make({"companion_voice_enabled": False})
+    assert a.start() is False
+    assert a.state == "off"
+
+
+def test_start_does_not_load_model_synchronously(monkeypatch):
+    """start() 绝不在调用线程加载模型（这就是旧版卡死的根因）。
+
+    这里把 sounddevice 换成假模块、_load_models 换成一个如果被同步调用就标记的桩，
+    验证 start() 返回时 _load_models 还没在调用线程里跑完。
+    """
+    import sys
+
+    loaded = {"in_caller": False}
+    a = _make({"companion_voice_enabled": True})
+    a._resolve_device = lambda: None  # type: ignore[assignment]
+
+    def fake_load():
+        loaded["in_caller"] = True
+        # 模拟慢加载
+        import time as _t
+        _t.sleep(0.05)
+        return False
+
+    a._load_models = fake_load  # type: ignore[assignment]
+
+    # 假 sounddevice，避免真的去开麦
+    fake_sd = types.SimpleNamespace(InputStream=lambda **k: None, query_devices=lambda: [])
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+
+    ok = a.start()
+    # start() 返回时，模型加载应发生在后台线程，而非调用线程
+    assert ok is True
+    assert loaded["in_caller"] is False
+    # 清理后台线程
+    a.stop()
+
+
+def test_stop_is_nonblocking_and_resets_state():
+    a = _make({"companion_voice_enabled": False})
+    a.start()
+    a.stop()
+    assert a.state == "off"
+    assert a._thread is None
+
+
+def test_load_models_reports_error_when_no_model(monkeypatch):
+    """没有可用模型时，_load_models 返回 False 并发 error，不抛异常。"""
+    from pet.companion import asr as asr_mod
+
+    monkeypatch.setattr(asr_mod, "resolve_model_dir", lambda cfg: "")
+    a = _make({"companion_voice_enabled": True})
+    errs = []
+    a.error.connect(lambda m: errs.append(m))
+    assert a._load_models() is False
+    assert errs, "应发出 error 信号"
+

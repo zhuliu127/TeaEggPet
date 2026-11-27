@@ -46,7 +46,9 @@ def test_download_uses_mirror_and_restores_env(monkeypatch, tmp_path):
     assert calls, "snapshot_download 应被调用"
     assert calls[0]["endpoint"] == asr.HF_MIRROR
     assert calls[0]["repo_id"] == "Systran/faster-whisper-small"
-    assert calls[0]["tqdm_class"] is asr._disabled_tqdm
+    # tqdm_class 是进度回调工厂产出的子类，不是裸 tqdm
+    assert calls[0]["tqdm_class"] is not asr.HF_MIRROR
+    assert "tqdm_class" in calls[0]
     # 调用期间 env 指向镜像 + 关进度条
     assert seen["endpoint_env"] == asr.HF_MIRROR
     assert seen["progress_env"] == "1"
@@ -79,15 +81,36 @@ def test_download_raises_when_all_endpoints_fail(monkeypatch, tmp_path):
         asr.download_model("tiny", tmp_path)
 
 
-def test_disabled_tqdm_never_touches_stderr():
-    """禁用的 tqdm 实例可正常调用各种方法且不写 stderr。"""
-    t = asr._disabled_tqdm(total=100)
+def test_progress_tqdm_never_touches_stderr():
+    """进度回调用的 tqdm 子类可正常调用各种方法且不写 stderr。"""
+    ticks = []
+    cls = asr._make_progress_tqdm(lambda *a: ticks.append(a))
+    t = cls(total=100)
     # 这些方法 hub 内部都会用，必须都存在且不抛
     t.update(5)
     t.set_description_str("x")
     t.set_description("y")
     t.set_postfix_str("z")
     t.close()
+
+
+def test_download_reports_progress_dict(monkeypatch, tmp_path):
+    """on_progress 收到的是含 percent/text 的 dict。"""
+    seen = []
+
+    def fake_snapshot_download(**kwargs):
+        # 模拟 hub 调用 tqdm_class 里的 update/close
+        klass = kwargs["tqdm_class"]
+        obj = klass(total=100)
+        obj.update(50)
+        obj.close()
+        return str(tmp_path / "tiny")
+
+    monkeypatch.setattr(asr, "_hf_hub_modules", lambda: fake_snapshot_download)
+    asr.download_model("tiny", tmp_path, on_progress=lambda p: seen.append(p))
+    dicts = [p for p in seen if isinstance(p, dict)]
+    assert dicts, "应有 dict 形式的进度回报"
+    assert any("percent" in p for p in dicts)
 
 
 # ---------------------------------------------------------------- 引擎回退

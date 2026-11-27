@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -934,6 +935,23 @@ class CompanionSettingsDialog(QDialog):
         row.addWidget(self.whisper_download_btn)
         form.addRow("识别模型", self._wrap(row))
 
+        # ---- 下载进度（进度条 + 已下/总量/速度文字）----
+        self.whisper_progress = QProgressBar()
+        self.whisper_progress.setRange(0, 100)
+        self.whisper_progress.setValue(0)
+        self.whisper_progress.setTextVisible(True)
+        self.whisper_progress.setFormat("%p%")
+        self.whisper_progress.setVisible(False)
+        self.whisper_progress_label = QLabel("")
+        self.whisper_progress_label.setWordWrap(True)
+        self.whisper_progress_label.setVisible(False)
+        prog_col = QVBoxLayout()
+        prog_col.setContentsMargins(0, 0, 0, 0)
+        prog_col.setSpacing(2)
+        prog_col.addWidget(self.whisper_progress)
+        prog_col.addWidget(self.whisper_progress_label)
+        form.addRow("下载进度", self._wrap(prog_col))
+
         row = QHBoxLayout()
         self.whisper_path = QLineEdit()
         self.whisper_path.setPlaceholderText("留空 = 用下载的模型；也可填自己下好的模型目录")
@@ -1039,24 +1057,46 @@ class CompanionSettingsDialog(QDialog):
         store = self.store
         dest = str(store.whisper_models_dir())
         self.whisper_download_btn.setEnabled(False)
+        # 复位并显示进度条
+        self.whisper_progress.setValue(0)
+        self.whisper_progress.setFormat("%p%")
+        self.whisper_progress.setVisible(True)
+        self.whisper_progress_label.setVisible(True)
+        self.whisper_progress_label.setText(f"准备下载 {size} …")
         self.voice_status.setText(f"开始下载 {size}（从国内镜像）…")
 
         def run():
             bridge = self._bridge
 
-            def _report(msg):
-                bridge.post(lambda m=msg: self.voice_status.setText(m))
+            def _report(payload):
+                # payload 可能是 dict（新格式，含 percent/text/rate）或 str（旧格式）
+                def _apply(p=payload):
+                    if isinstance(p, dict):
+                        pct = p.get("percent")
+                        if pct is not None:
+                            self.whisper_progress.setValue(int(round(float(pct))))
+                        txt = p.get("text") or p.get("msg")
+                        if txt:
+                            self.whisper_progress_label.setText(str(txt))
+                            self.voice_status.setText(str(txt))
+                    else:
+                        self.whisper_progress_label.setText(str(p))
+                        self.voice_status.setText(str(p))
+                bridge.post(_apply)
 
             return asr_mod.download_model(size, dest, on_progress=_report)
 
         def ok(path):
             self.whisper_download_btn.setEnabled(True)
+            self.whisper_progress.setValue(100)
+            self.whisper_progress_label.setText("下载完成")
             self.whisper_path.setText(str(path))
             self.voice_status.setText(f"下载完成：{path}")
             self._scan_whisper_models()
 
         def bad(msg):
             self.whisper_download_btn.setEnabled(True)
+            self.whisper_progress_label.setText(f"下载失败：{msg}")
             self.voice_status.setText(f"下载失败：{msg}")
 
         self._run_task(run, ok, self.whisper_download_btn, bad)

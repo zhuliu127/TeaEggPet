@@ -71,64 +71,122 @@ def _hf_hub_modules():
     return snapshot_download
 
 
-def _disabled_tqdm(total=None, *args, **kwargs):
-    """返回一个「禁用」的 tqdm 实例（不画任何东西，也不碰 sys.stderr）。
+def _make_progress_tqdm(on_tick):
+    """构造一个「静默但可观测」的 tqdm 子类，用于把下载进度回报给 UI。
 
     windowed（console=False）的 PyInstaller 程序里 ``sys.stderr`` 是 ``None``，
     huggingface_hub 下载时若画进度条会往 stderr 写 →
     ``'NoneType' object has no attribute 'write'`` 直接崩，模型下不下来。
-    这里用一个真正的 tqdm 子类实例但 ``disable=True``——API 齐全（set_description_str
-    等都要有），写入全丢弃，彻底不碰 stderr。
+    所以这里始终 ``disable=True``（绝不碰 stderr），但重写 ``update``/``close``
+    把 ``(已下载字节, 总字节, 速度字节/秒, 预计剩余秒)`` 交给 ``on_tick`` 回调。
+
+    huggingface_hub 会用它 **每个文件** 各开一个 tqdm；这里把它累计到总量：
+    第一次见到的 tqdm 记「基准已下载」，之后按 n 累加，配合一个可变 dict 汇总。
     """
     try:
         from tqdm.auto import tqdm as _tqdm  # type: ignore
-
-        return _tqdm(total=total, *args, disable=True, **kwargs)
     except Exception:  # noqa: BLE001
-        # 连 tqdm 都没有：返回一个最简空壳（hub 需要的基础方法都实现）
-        class _Null:
-            def __init__(self, *a, **k):
-                self.n = 0
-                self.total = total
+        _tqdm = None
 
-            def update(self, *a, **k):
-                pass
+    # 跨进程内所有文件、跨所有 tqdm 实例共享的累计状态
+    agg = {"done": 0.0, "files_total": 0.0, "last": None}
 
-            def close(self):
-                pass
+    def _emit(n, total, rate):
+        try:
+            on_tick(agg, n, total, rate)
+        except Exception:  # noqa: BLE001
+            pass
 
-            def set_description(self, *a, **k):
-                pass
+    if _tqdm is not None:
+        class _ProgTqdm(_tqdm):  # type: ignore[misc]
+            def __init__(self, *args, total=None, **kwargs):
+                kwargs["disable"] = True   # 绝不碰 stderr
+                super().__init__(*args, total=total, **kwargs)
+                self._own_total = float(total or 0)
+                if self._own_total:
+                    agg["files_total"] += self._own_total
+                self._prev = 0.0
 
-            def set_description_str(self, *a, **k):
-                pass
+            def update(self, n=1):  # noqa: D102
+                try:
+                    r = super().update(n)
+                except Exception:  # noqa: BLE001
+                    r = None
+                # 注意：disable=True 时 tqdm 的 self.n 不会前进，只能自己累加
+                d = float(n or 0)
+                if d > 0:
+                    self._prev += d
+                    agg["done"] += d
+                _emit(agg["done"], agg["files_total"], getattr(self, "format_dict", {}) or {})
+                return r
 
-            def set_postfix(self, *a, **k):
-                pass
+            def close(self):  # noqa: D102
+                try:
+                    return super().close()
+                finally:
+                    _emit(agg["done"], agg["files_total"], {})
 
-            def set_postfix_str(self, *a, **k):
-                pass
+        return _ProgTqdm
 
-            def __enter__(self):
-                return self
+    # 连 tqdm 都没有：返回一个最简空壳（hub 需要的基础方法都实现）
+    class _Null:
+        def __init__(self, *a, total=None, **k):
+            self.n = 0
+            self.total = total
+            self.format_dict = {}
 
-            def __exit__(self, *e):
-                return False
+        def update(self, *a, **k):
+            pass
 
-        return _Null()
+        def close(self):
+            pass
+
+        def set_description(self, *a, **k):
+            pass
+
+        def set_description_str(self, *a, **k):
+            pass
+
+        def set_postfix(self, *a, **k):
+            pass
+
+        def set_postfix_str(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *e):
+            return False
+
+    return _Null
+
+
+def _fmt_bytes(n: float) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
 
 
 def download_model(
     size: str,
     dest_root: str | Path,
     *,
-    on_progress: Callable[[str], None] | None = None,
+    on_progress: Callable[[dict], None] | None = None,
     cancel: threading.Event | None = None,
 ) -> str:
     """把 ``Systran/faster-whisper-<size>`` 下载到 ``dest_root/<size>`` 并返回该目录。
 
     走国内镜像 ``HF_MIRROR``（只在下载期间设 ``HF_ENDPOINT``，下完还原），
-    不需要用户配代理。``on_progress`` 收进度文字（供 UI 状态栏显示）。
+    不需要用户配代理。
+
+    ``on_progress`` 现在收一个 **结构化进度字典**（供 UI 画进度条/速度）：
+        {"done": 已下载字节, "total": 总字节, "percent": 0-100 或 None,
+         "rate": 字节/秒 或 None, "text": 一句人类可读的话}
+    为了兼容旧调用（只当状态文字用），字典里也带 ``"msg": 同 text``。
     """
     if size not in _VALID_SIZES:
         raise ValueError(f"不支持的模型大小：{size}（可选：{'/'.join(_VALID_SIZES)}）")
@@ -136,10 +194,12 @@ def download_model(
     target = dest_root / size
     target.mkdir(parents=True, exist_ok=True)
 
-    def _emit(msg: str) -> None:
+    def _emit(msg: str, **extra) -> None:
         if on_progress is not None:
+            payload = {"done": 0, "total": 0, "percent": None, "rate": None, "text": msg, "msg": msg}
+            payload.update(extra)
             try:
-                on_progress(msg)
+                on_progress(payload)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -160,6 +220,46 @@ def download_model(
     os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
     _emit(f"正在从国内镜像下载 {size} 模型…（{model_label(size)}）")
+
+    # 进度回报：把 tqdm 的累计状态换算成 百分比/速度/文字，节流到约每 0.15s 一次
+    _last_report = [0.0]
+    _rate_state = {"t": None, "done": 0.0, "rate": 0.0}
+
+    def _on_tick(agg, n, total, fmt):
+        import time as _time
+
+        now = _time.time()
+        done = float(agg.get("done") or n or 0)
+        tot = float(agg.get("files_total") or total or 0)
+        # 自己按时间差算速度（disable=True 时 tqdm 的 format_dict 里没有 rate）
+        lt = _rate_state["t"]
+        if lt is not None and now > lt:
+            dbytes = done - _rate_state["done"]
+            inst = dbytes / (now - lt)
+            if inst > 0:
+                # 指数平滑，避免数字乱跳
+                _rate_state["rate"] = inst if _rate_state["rate"] <= 0 else (
+                    _rate_state["rate"] * 0.7 + inst * 0.3)
+        _rate_state["t"] = now
+        _rate_state["done"] = done
+        # 节流
+        if now - _last_report[0] < 0.15:
+            return
+        _last_report[0] = now
+        if not tot:
+            return
+        pct = max(0.0, min(100.0, done * 100.0 / tot))
+        rate = _rate_state["rate"] or None
+        rate_txt = (f" · {_fmt_bytes(rate)}/s" if rate else "")
+        text = f"正在下载 {size}：{_fmt_bytes(done)} / {_fmt_bytes(tot)}（{pct:.0f}%{rate_txt}）"
+        try:
+            on_progress and on_progress({
+                "done": done, "total": tot, "percent": pct, "rate": rate,
+                "text": text, "msg": text,
+            })
+        except Exception:  # noqa: BLE001
+            pass
+
     last_exc: Exception | None = None
     try:
         snapshot_download = _hf_hub_modules()
@@ -176,7 +276,7 @@ def download_model(
                     allow_patterns=["*.bin", "*.json", "*.txt", "*.model"],
                     max_workers=4,
                     endpoint=endpoint,
-                    tqdm_class=_disabled_tqdm,
+                    tqdm_class=_make_progress_tqdm(_on_tick),
                 )
                 last_exc = None
                 break
@@ -197,7 +297,7 @@ def download_model(
     if cancel is not None and cancel.is_set():
         _emit("下载已取消")
         return str(target)
-    _emit(f"下载完成：{target}")
+    _emit(f"下载完成：{target}", percent=100.0)
     return str(target)
 
 
@@ -283,6 +383,10 @@ def _guess_size_from_path(path: Path) -> str:
 
 _engine_cache: dict[str, Any] = {}
 _engine_lock = threading.Lock()
+# GPU 可用性探测结果缓存：None=未探过，True/False=已知。
+# 一旦探明 CUDA 不可用（缺 cublas/cudart），后续所有加载直接走 CPU，
+# 不再反复构造 CUDA 引擎——某些环境下对已存在的 CUDA 引擎再构造另一个模型会挂死。
+_cuda_available: "bool | None" = None
 
 
 def load_engine(model_path: str, *, device: str = "cpu", compute_type: str = "int8"):
@@ -299,10 +403,21 @@ def load_engine(model_path: str, *, device: str = "cpu", compute_type: str = "in
     一个装不起来的设备把整个语音助手拖死。
     """
     device = (device or "cpu").strip().lower()
+    global _cuda_available
+    # 已知 CUDA 不可用就别再试，直接 CPU——避免在坏 CUDA 上反复构造导致挂死。
+    if device != "cpu" and _cuda_available is False:
+        device = "cpu"
     key = f"{model_path}|{device}|{compute_type}"
     with _engine_lock:
         if key in _engine_cache:
             return _engine_cache[key]
+        # ctranslate2 在同一进程里对【同一个模型目录】用不同 compute_type 再构造一次
+        # 会死锁（实测第二次 load 永久挂起）。所以只要这个路径已经加载过任何引擎，
+        # 就直接复用——反正最终都是 CPU/int8，没必要重复加载。
+        for _k, _v in _engine_cache.items():
+            if _k.rsplit("|", 2)[0] == str(model_path).rstrip("\\/"):
+                _engine_cache[key] = _v
+                return _v
         from faster_whisper import WhisperModel  # type: ignore
 
         def _make(dev: str, ctype: str):
@@ -316,24 +431,26 @@ def load_engine(model_path: str, *, device: str = "cpu", compute_type: str = "in
                 cand = _make(device, compute_type)
                 _probe_encode(cand)
                 engine = cand
+                _cuda_available = True
             except Exception as exc:  # noqa: BLE001
+                _cuda_available = False
                 log.warning(
                     "WhisperModel 以 %s/%s 加载失败，自动回退 CPU/int8：%s",
                     device, compute_type, exc,
                 )
+                # 显式释放坏的 CUDA 引擎，避免它残留的库句柄干扰后续 CPU 加载
                 try:
-                    from . import runtime as _rt  # noqa: F401  仅用于日志上下文
-
-                    _ = _rt
+                    del cand
                 except Exception:  # noqa: BLE001
                     pass
+                import gc as _gc
+
+                _gc.collect()
                 engine = None
+                compute_type = "int8"
         if engine is None:
             # CPU 兜底：int8 在 CPU 上足够快（实测 1s 音频 0.01s）
-            if device == "cpu":
-                engine = _make("cpu", compute_type)
-            else:
-                engine = _make("cpu", "int8")
+            engine = _make("cpu", "int8")
         _engine_cache[key] = engine
         return engine
 
