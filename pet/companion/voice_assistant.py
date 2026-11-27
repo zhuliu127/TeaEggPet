@@ -68,6 +68,36 @@ def _contains_any(text: str, words: list[str]) -> str:
     return ""
 
 
+def _looks_hallucinated(text: str) -> bool:
+    """判断一段 whisper 转写是不是「幻听」（把静音/噪声硬编出一堆字）。
+
+    背景：把十几秒的背景噪声喂给 whisper，又被 initial_prompt 偏置到唤醒词，
+    它会把提示词无限重复（日志里出现过一长串「小鱼小鱼小鱼…」）。这种结果
+    绝不能当成用户说了唤醒词，否则会在没人说话时莫名其妙「被唤醒」。
+    规则（命中任一即视为幻听）：
+      * 去标点后长度过长（人喊唤醒词/短句不会几十上百字）；
+      * 内部重复度极高（某 2~4 字片段反复出现很多次）。
+    """
+    t = _norm(text)
+    if not t:
+        return True
+    n = len(t)
+    if n > 24:  # 唤醒/短指令不会这么长，基本是幻听
+        return True
+    # 2~4 字片段重复次数检测
+    for seg_len in (2, 3, 4):
+        if n < seg_len * 4:
+            continue
+        counts = {}
+        for i in range(n - seg_len + 1):
+            seg = t[i:i + seg_len]
+            counts[seg] = counts.get(seg, 0) + 1
+        if counts and max(counts.values()) >= 4:
+            return True
+    return False
+
+
+
 class VoiceAssistantError(RuntimeError):
     pass
 
@@ -471,7 +501,7 @@ class VoiceAssistant(QObject):
         silence_blocks = 0
         speaking = False
         silence_limit = int(0.6 / (BLOCK_MS / 1000.0))  # 0.6 秒静音判定一句话结束
-        max_seg_sec = 15.0
+        max_seg_sec = 8.0
 
         # 自适应能量门限：先按一个较低初值，持续跟踪底噪（静音块 RMS 的滑窗分位）
         energy_threshold = 0.004
@@ -579,8 +609,6 @@ class VoiceAssistant(QObject):
                                  rms, self._state)
                     continue
 
-                buffer = np.concatenate([buffer, chunk])
-
                 # 自适应门限：把底噪推高到当前 RMS 的平滑值，门限 = 底噪 * 3 且不小于 0.003
                 if rms < energy_threshold:
                     noise_floor = 0.98 * noise_floor + 0.02 * rms
@@ -593,12 +621,23 @@ class VoiceAssistant(QObject):
                     last_level_log = now
                     log.info("麦克风电平 rms=%.4f 门限=%.4f 状态=%s", rms, energy_threshold, self._state)
 
+                # 只有「检测到语音」才开始往缓冲里攒，避免把大量静音/噪声攒成一坨
+                # 十几秒的片段丢给 whisper（whisper 会把静音硬编成一串幻听文字）。
+                if not speaking and not speech:
+                    # 还没开口：不攒缓冲，保持底噪跟踪即可
+                    buffer = np.zeros(0, dtype=np.float32)
+                    silence_blocks = 0
+                    continue
+
+                buffer = np.concatenate([buffer, chunk])
+
                 if speech:
                     speaking = True
                     silence_blocks = 0
                 else:
                     if speaking:
                         silence_blocks += 1
+
                 seg_too_long = buffer.shape[0] > int(max_seg_sec * SAMPLE_RATE)
                 seg_done = speaking and silence_blocks >= silence_limit
                 if not (seg_done or seg_too_long):
@@ -610,16 +649,26 @@ class VoiceAssistant(QObject):
                 silence_blocks = 0
                 if audio.shape[0] < int(0.3 * SAMPLE_RATE):
                     continue
-                # Silero VAD 精修（去掉首尾/中间静音）
+                # Silero VAD 精修（去掉首尾/中间静音）；去掉后没有语音就整段丢弃
                 try:
                     ts = get_speech_timestamps(audio, vad_options=vad_opts)
                     if ts:
                         a = ts[0]["start"]; b = ts[-1]["end"]
                         audio = audio[a:b]
+                    else:
+                        # VAD 认为整段都没有语音 → 是噪声/静音，直接丢弃，不喂 whisper
+                        continue
                 except Exception:  # noqa: BLE001
                     pass
                 if audio.shape[0] < int(0.25 * SAMPLE_RATE):
                     continue
+                # 再按实际能量复核一遍：有效语音占比太低也丢掉（防噪声误触发）
+                try:
+                    seg_rms = float(np.sqrt(np.mean(audio ** 2)) + 1e-9)
+                    if seg_rms < 0.003:
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
                 try:
                     self._handle_segment(audio)
                 except Exception:  # noqa: BLE001
@@ -666,6 +715,10 @@ class VoiceAssistant(QObject):
                                   initial_prompt=f"{wake}。")
             self.heard.emit(f"[待命] {text}")
             log.info("待命听到：%r（唤醒词=%r）", text, wake)
+            # 幻听过滤：把静音/噪声硬编成一长串重复字的，绝不当成唤醒
+            if _looks_hallucinated(text):
+                log.info("待命片段疑似幻听，忽略：%r", text)
+                return
             if _contains_any(text, [wake]) or self._fuzzy_wake(text):
                 self._enter_dialog()
             return
@@ -927,7 +980,10 @@ class VoiceAssistant(QObject):
             if ok:
                 # 念这句大概要多久：按字数估（中文约 5 字/秒），至少 1.2 秒静默防抖，
                 # 防止把她自己的声音当成用户说话。
-                dur = max(1.2, len(text) / 5.0 + 0.6)
+                # **务必封顶**：曾经因为一段转写异常长（幻听）导致 dur 被算成几十秒，
+                # 静音窗口把麦克风堵死一大段时间，用户说什么都听不到。这里把估算
+                # 字符数和总时长都限制在合理范围（一句话不会超过 8 秒）。
+                dur = max(1.2, min(8.0, len(text) / 5.0 + 0.6))
                 self._mute_until = max(self._mute_until, time.time() + dur)
         except Exception:  # noqa: BLE001
             log.debug("语音助手出声失败", exc_info=True)

@@ -300,3 +300,88 @@ def test_send_to_chat_sets_busy_immediately():
     a._busy_reply = True
     a._busy_deadline = time.time() + 25.0
     assert a._busy_reply is True and a._busy_deadline > time.time()
+
+
+# ---------------------------------------------------------------- 幻听过滤 (v1.4.19)
+def test_looks_hallucinated_rejects_repeated_wake_word():
+    """把一长串重复的「小鱼小鱼小鱼…」判为幻听，避免凭空唤醒。"""
+    assert va._looks_hallucinated("小鱼小鱼小鱼小鱼小鱼小鱼小鱼小鱼小鱼小鱼") is True
+    assert va._looks_hallucinated("小鱼小鱼小鱼 小鱼小鱼 小鱼 小出快 confinement") is True
+
+
+def test_looks_hallucinated_accepts_normal_short():
+    """正常的短句/唤醒词不算幻听。"""
+    assert va._looks_hallucinated("小鱼小鱼") is False
+    assert va._looks_hallucinated("照顾滾") is False
+    assert va._looks_hallucinated("来啦来啦，想聊点什么呀？") is False
+    assert va._looks_hallucinated("") is True
+
+
+def test_idle_hallucination_does_not_wake():
+    """idle 态下即便转写里含唤醒词，只要是幻听就不应进入对话。"""
+    import numpy as np
+    a = _make({"companion_voice_wake_word": "小鱼小鱼"})
+    woke = {"v": False}
+    a.woke.connect(lambda: woke.__setitem__("v", True))
+
+    def fake_transcribe(engine, audio, **kw):
+        return "小鱼小鱼小鱼小鱼小鱼小鱼小鱼小鱼小鱼小鱼小鱼小鱼"
+
+    import pet.companion.asr as asr_mod
+    orig = asr_mod.transcribe
+    asr_mod.transcribe = fake_transcribe
+    try:
+        a._state = "idle"
+        a._handle_segment(np.zeros(16000, dtype=np.float32))
+    finally:
+        asr_mod.transcribe = orig
+    assert woke["v"] is False
+    assert a._state == "idle"
+
+
+def test_idle_real_wake_still_works():
+    """正常听到「小鱼小鱼」仍能唤醒（别把真唤醒也误杀）。"""
+    import numpy as np
+    a = _make({"companion_voice_wake_word": "小鱼小鱼"})
+    a._greet = lambda: None  # type: ignore[assignment]
+    woke = {"v": False}
+    a.woke.connect(lambda: woke.__setitem__("v", True))
+
+    def fake_transcribe(engine, audio, **kw):
+        return "小鱼小鱼"
+
+    import pet.companion.asr as asr_mod
+    orig = asr_mod.transcribe
+    asr_mod.transcribe = fake_transcribe
+    try:
+        a._state = "idle"
+        a._handle_segment(np.zeros(16000, dtype=np.float32))
+    finally:
+        asr_mod.transcribe = orig
+    assert woke["v"] is True
+    assert a._state == "dialog"
+
+
+def test_say_mute_duration_capped():
+    """_say 的静音窗口必须封顶（≤8s），防止超长文本/幻听把麦克风堵死一大段时间。"""
+    import time
+    a = _make({})
+    # 用一个假的 tts 模块让 speak_text 返回 True
+    import sys, types
+    fake_tts = types.SimpleNamespace()
+    fake_tts.speak_text = lambda text, store, kind="chat": True
+    fake_tts.speaker = lambda: types.SimpleNamespace(busy=False)
+    sys.modules.setdefault("pet.companion.tts", fake_tts)
+    orig = sys.modules.get("pet.companion.tts")
+    sys.modules["pet.companion.tts"] = fake_tts
+    import pet.companion as _pkg
+    setattr(_pkg, "tts", fake_tts)
+    try:
+        a._mute_until = 0.0
+        before = time.time()
+        a._say("这个" * 200)  # 400 字，旧逻辑会算出 ~80s
+        dur = a._mute_until - before
+    finally:
+        if orig is not None:
+            sys.modules["pet.companion.tts"] = orig
+    assert dur <= 8.5, f"静音窗口过长：{dur}"
