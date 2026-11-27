@@ -190,6 +190,11 @@ class VoiceAssistant(QObject):
         self._last_active = 0.0       # 最后一次听到说话的时间（对话超时用）
         self._device_index: int | None = None
         self._restart_pending = False  # 旧线程退出后是否需要自动重启（reload 用）
+        # 「她自己在说话」时段：这段时间麦克风收到的是她自己的 TTS 声音，
+        # 必须丢弃，否则会把「嗯，我在听」当成用户说话再识别一遍 → 自问自答/死循环。
+        self._mute_until = 0.0
+        self._busy_reply = False  # AI 正在生成/朗读回复，期间不采集新的一句
+        self._busy_deadline = 0.0  # 忙碌兜底超时（防回调没来）
 
     # ------------------------------------------------------------ 配置读取
     def _store(self):
@@ -237,13 +242,49 @@ class VoiceAssistant(QObject):
         self._stop.clear()
         self._pending_selfie = False
         self._last_active = time.time()
+        self._busy_reply = False
         self._engine = None
         self._kws_engine = None
+        self._register_chat_hook()
         self._thread = threading.Thread(target=self._run, name="VoiceAssistant", daemon=True)
         self._thread.start()
         self._set_state("idle")
         self.status.emit("语音助手正在启动…（首次加载模型可能要等几秒）")
         return True
+
+    # ------------------------------------------------------------ 回复联动
+    def _register_chat_hook(self) -> None:
+        """订阅「AI 回复完成」：清掉 _busy_reply，并把回复冒成她的气泡。
+
+        这样用户能在桌宠身上直接看到她在回什么（豆包式一问一答的可视反馈），
+        同时 AI 生成期间采集端知道她在忙、不做无谓识别。
+        """
+        try:
+            from ..chat.service import ChatService
+
+            ChatService.register_global_finished(self._on_chat_finished)
+        except Exception:  # noqa: BLE001
+            log.debug("订阅语音回复完成失败", exc_info=True)
+
+    def _unregister_chat_hook(self) -> None:
+        try:
+            from ..chat.service import ChatService
+
+            ChatService.unregister_global_finished(self._on_chat_finished)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_chat_finished(self, user_text: str = "", reply: str = "") -> None:
+        """AI 回复完成（GUI 线程回调）：解除忙碌，把回复显示成气泡。"""
+        self._busy_reply = False
+        # 只有语音对话进行中才把回复冒成气泡（避免干扰手动聊天的界面）
+        if self._state in ("dialog", "confirm") and reply:
+            try:
+                from . import runtime as rt
+
+                rt.bubble(str(reply), 8000)
+            except Exception:  # noqa: BLE001
+                log.debug("显示回复气泡失败", exc_info=True)
 
     def _load_models(self) -> bool:
         """在后台线程里加载主模型 + 唤醒词模型。失败发 error 并返回 False。"""
@@ -338,6 +379,7 @@ class VoiceAssistant(QObject):
         ``_stop`` 后会自行关流退出；模型加载中也不影响——加载完会立即发现
         ``_stop`` 已置位而直接退出。"""
         self._stop.set()
+        self._unregister_chat_hook()
         self._set_state("off")
 
     def reload(self) -> None:
@@ -491,8 +533,22 @@ class VoiceAssistant(QObject):
                     continue
                 raw = data[:, 0].copy() if data.ndim > 1 else data.copy()
                 chunk = _resample_to_16k(raw) if capture_sr != SAMPLE_RATE else raw.astype(np.float32)
-                buffer = np.concatenate([buffer, chunk])
                 rms = float(np.sqrt(np.mean(raw ** 2)) + 1e-9)
+
+                # 她自己在说话（TTS 播报 / AI 生成回复中）：这段时间麦克风收到的是
+                # 她自己的声音，直接丢弃，绝不当成用户说话，否则会自问自答死循环。
+                if self._is_muted():
+                    buffer = np.zeros(0, dtype=np.float32)
+                    speaking = False
+                    silence_blocks = 0
+                    now = time.time()
+                    if now - last_level_log > 3.0:
+                        last_level_log = now
+                        log.info("麦克风电平 rms=%.4f（她正在说话，已静音采集）状态=%s",
+                                 rms, self._state)
+                    continue
+
+                buffer = np.concatenate([buffer, chunk])
 
                 # 自适应门限：把底噪推高到当前 RMS 的平滑值，门限 = 底噪 * 3 且不小于 0.003
                 if rms < energy_threshold:
@@ -627,9 +683,15 @@ class VoiceAssistant(QObject):
         self.status.emit("已唤醒，正在对话中（说「%s」结束）" % self._sleep_word())
 
     def _greet(self) -> None:
-        """被唤醒的正反馈：说一段打招呼的话 + 让桌宠做一个动画动作。"""
+        """被唤醒的正反馈：说一段打招呼的话 + 让桌宠做一个动画动作，并清空麦克风缓冲。
+
+        关键是「先给她自己说话留够静音窗口」（_say 会设 _mute_until），把
+        打招呼这段话的回声挡在采集之外，招呼说完后才真正开始听用户说什么。
+        """
         import random
 
+        # 先清掉唤醒前残留的音频，避免把唤醒词那句拖进这一轮
+        self._last_active = time.time()
         lines = (
             "嗯，我在听～",
             "诶？叫我啦，我在～",
@@ -743,20 +805,29 @@ class VoiceAssistant(QObject):
 
     # ------------------------------------------------------------ 发进对话
     def _send_to_chat(self, text: str) -> None:
+        # 从这刻起她在「忙」：AI 生成 + 朗读回复期间采集端静音，避免把环境音
+        # 或她自己念回复的声音当成用户下一条。回复完成回调会清掉这个标志。
+        self._busy_reply = True
+        self._busy_deadline = time.time() + 25.0
+        self._last_active = time.time()
+
         def _go():
             try:
                 from . import runtime
 
                 app = runtime.app()
                 if app is None:
+                    self._busy_reply = False
                     return
                 # 复用完整聊天窗的程序化入口（会自动落盘、记忆、TTS 回复朗读）
                 window = self._ensure_chat(app)
                 if window is None:
+                    self._busy_reply = False
                     self._say("对话窗口打不开，我先记下你这句。")
                     return
                 window.voice_submit(text)
             except Exception:  # noqa: BLE001
+                self._busy_reply = False
                 log.exception("语音消息发送到对话失败")
 
         QTimer.singleShot(0, _go)
@@ -785,16 +856,48 @@ class VoiceAssistant(QObject):
 
     # ------------------------------------------------------------ 出声
     def _say(self, text: str) -> None:
-        """用本地 TTS 念一句（没开 TTS 就静默，只走气泡/状态）。"""
+        """用本地 TTS 念一句（没开 TTS 就静默），同时在桌宠上冒一个气泡，让反馈看得见。"""
+        text = str(text or "").strip()
+        if not text:
+            return
+        # 气泡：无论有没有开 TTS 都能看到的一句话反馈
+        try:
+            from . import runtime as rt
+
+            rt.bubble(text, 6000)
+        except Exception:  # noqa: BLE001
+            log.debug("语音助手气泡失败", exc_info=True)
         try:
             from . import tts as tts_mod
 
             store = self._store()
             if store is None:
                 return
-            tts_mod.speak_text(text, store, kind="chat")
+            ok = tts_mod.speak_text(text, store, kind="chat")
+            if ok:
+                # 念这句大概要多久：按字数估（中文约 5 字/秒），至少 1.2 秒静默防抖，
+                # 防止把她自己的声音当成用户说话。
+                dur = max(1.2, len(text) / 5.0 + 0.6)
+                self._mute_until = max(self._mute_until, time.time() + dur)
         except Exception:  # noqa: BLE001
             log.debug("语音助手出声失败", exc_info=True)
+
+    def _tts_busy(self) -> bool:
+        """本地 TTS 是否正在出声（用于采集端丢弃自己的回声）。"""
+        try:
+            from . import tts as tts_mod
+
+            return bool(getattr(tts_mod.speaker(), "busy", False))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _is_muted(self) -> bool:
+        # 回复忙碌有兜底超时：万一「回复完成」回调没来（网络错误等），
+        # 最多忙 25 秒，避免麦克风永远静音。
+        if self._busy_reply and self._busy_deadline and time.time() > self._busy_deadline:
+            self._busy_reply = False
+        return time.time() < self._mute_until or self._busy_reply or self._tts_busy()
+
 
     # ------------------------------------------------------------ 状态
     def _set_state(self, state: str) -> None:

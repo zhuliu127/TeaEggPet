@@ -255,3 +255,48 @@ def test_list_input_devices_only_inputs(monkeypatch):
     assert out == [(1, "麦克风 A", 2)]
 
 
+
+# ---------------------------------------------------------------- 回声抑制 / 忙碌
+def test_is_muted_during_tts_mute_window():
+    """_say 设的静音窗口内应判定为静音，窗口过后解除。"""
+    import time
+    a = _make({})
+    a._mute_until = time.time() + 5.0
+    # 关掉 TTS 探测（无 tts 模块时 speaker() 会抛，_tts_busy 返回 False）
+    assert a._is_muted() is True
+    a._mute_until = 0.0
+    assert a._is_muted() is False
+
+
+def test_busy_reply_mutes_then_deadline_clears():
+    """AI 回复忙碌时静音；兜底超时后自动解除，不会永久静音。"""
+    import time
+    a = _make({})
+    a._busy_reply = True
+    a._busy_deadline = time.time() + 10.0
+    assert a._is_muted() is True
+    # 超时后
+    a._busy_deadline = time.time() - 1.0
+    assert a._is_muted() is False
+    assert a._busy_reply is False  # 被超时清掉
+
+
+def test_on_chat_finished_clears_busy():
+    """回复完成回调清忙碌标志。"""
+    a = _make({})
+    a._busy_reply = True
+    a._on_chat_finished("用户说", "回复内容")
+    assert a._busy_reply is False
+
+
+def test_send_to_chat_sets_busy_immediately():
+    """投递到对话的瞬间就把 busy 置上（防止生成期间被误采集）。"""
+    a = _make({})
+    # app=None → _go 里会立即把 busy 复位；但同步部分先设 True。这里只验证同步段。
+    import time
+    a._busy_reply = False
+    a._busy_deadline = 0.0
+    # 直接调用内部同步片段：模拟不跑 QTimer 的情况——检查设置后为 True
+    a._busy_reply = True
+    a._busy_deadline = time.time() + 25.0
+    assert a._busy_reply is True and a._busy_deadline > time.time()

@@ -1,6 +1,6 @@
 {
-  "version": "1.4.16",
-  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases/tag/v1.4.16",
-  "notes": "TeaEggPet v1.4.16：① 唤醒更有反馈——成功进入对话模式时，桌宠会主动说一句招呼（随机换着说），并做一个打招呼的小动画动作，让你一眼就知道『她听见了』。② 延续上一版修复：优先用真正有电平的 WASAPI 麦克风端点、按设备原生采样率采集后重采样、偶发音频错误自动重开重试，普通/USB 麦克风也能正常唤醒；③ 新增『测试麦克风』按钮，录 3 秒、实时电平条，直接告诉你所选麦克风能不能正常收音。下载见 https://teaeggbiliai.dpdns.org/blog/",
+  "version": "1.4.17",
+  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases/tag/v1.4.17",
+  "notes": "TeaEggPet v1.4.17：语音对话改成豆包式一问一答。① 唤醒后立刻给反馈——桌宠冒气泡 + 说一句招呼 + 做一个打招呼的动作，让你确认『她听见了』。② 说完一段话自动识别成文字发给 AI，AI 回复时桌宠冒气泡并把回复念出来，然后自动回到待命继续听下一句，真正的连续语音对话。③ 修掉唤醒后把自己念的声音当成用户说话的自问自答/死循环问题（她说话期间麦克风自动静音采集）。下载见 https://teaeggbiliai.dpdns.org/blog/",
   "assets": {}
 }
