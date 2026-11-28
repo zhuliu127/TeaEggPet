@@ -471,6 +471,9 @@ class VoiceAssistant(QObject):
             except Exception:  # noqa: BLE001
                 pass
             self._rec_stream = None
+            # 关键：录音线程退出时清空句柄，否则下次按住会被 _on_pressed 的
+            # 「_rec_thread is not None」守卫挡掉 → 「之后再按没反应」。
+            self._rec_thread = None
 
     def _end_recording(self) -> None:
         """松开语音键：停录音 → 拼音频 → 后台识别 → 进对话。"""
@@ -846,20 +849,54 @@ class VoiceAssistant(QObject):
         QTimer.singleShot(0, _go)
 
     def _ensure_chat(self, app):
-        win = getattr(app, "modern_chat_window", None)
-        if win is not None:
-            try:
-                import shiboken6
+        """拿到/打开 AI 对话窗。
 
-                if shiboken6.isValid(win):
-                    return win
+        兼容两种宿主：
+        - App（有 open_modern_chat / modern_chat_window）；
+        - AppShell（overlay 拓扑下 runtime.app() 返回的其实是 AppShell，它只有
+          open_full_chat()，真正的 App 实例在 app._instance 上，聊天窗也在那上面）。
+        """
+        def _win_from(obj):
+            if obj is None:
+                return None
+            w = getattr(obj, "modern_chat_window", None)
+            if w is not None:
+                try:
+                    import shiboken6
+                    if shiboken6.isValid(w):
+                        return w
+                except Exception:  # noqa: BLE001
+                    return w
+            return None
+
+        # 1) 已经有可用的现代聊天窗（App 或 shell 底层 App 上）
+        win = _win_from(app) or _win_from(getattr(app, "_instance", None))
+        if win is not None:
+            return win
+
+        # 2) 打开聊天窗：按宿主实际拥有的方法
+        opener = None
+        for name in ("open_full_chat", "open_modern_chat", "open_chat"):
+            fn = getattr(app, name, None)
+            if callable(fn):
+                opener = fn
+                break
+        inst = getattr(app, "_instance", None)
+        if opener is None and inst is not None:
+            for name in ("open_modern_chat", "open_chat"):
+                fn = getattr(inst, name, None)
+                if callable(fn):
+                    opener = fn
+                    break
+        if opener is not None:
+            try:
+                opener()
             except Exception:  # noqa: BLE001
-                pass
-        try:
-            app.open_modern_chat()
-        except Exception:  # noqa: BLE001
-            log.exception("打开聊天窗失败")
-        return getattr(app, "modern_chat_window", None)
+                log.exception("打开聊天窗失败")
+        else:
+            log.warning("当前宿主没有可用的打开聊天窗方法：%r", type(app).__name__)
+
+        return _win_from(app) or _win_from(getattr(app, "_instance", None))
 
     # ------------------------------------------------------------ 出声
     def _say(self, text: str) -> None:

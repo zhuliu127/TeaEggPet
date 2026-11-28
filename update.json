@@ -1,6 +1,6 @@
 {
-  "version": "1.4.27",
-  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases/tag/v1.4.27",
-  "notes": "修复「看到正在听你说话提示、松开后却不进对话」：\n真相是——Whisper 识别其实成功了（日志里能看到识别结果），但识别跑在后台线程，之前用 QTimer 从后台线程投递「派发对话」，而后台线程没有 Qt 事件循环，定时器永远不触发，所以消息根本没发进 AI 对话。现在改成用 Qt 信号（跨线程队列）把识别结果投递回主线程再派发，松开后就会自动发消息、AI 回复并用语音念出来。\n另外：按住语音键时桌宠头上会显示「🎤 正在听你说话…」，松开收起。",
+  "version": "1.4.28",
+  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases/tag/v1.4.28",
+  "notes": "v1.4.28 修复：\n1. 修复「对话窗口打不开」——overlay 宿主下打开聊天窗失败（AppShell 没有 open_modern_chat），改为兼容 AppShell，改用 open_full_chat 并取 _instance 上的聊天窗，识别出的文字现在能正常进 AI 对话。\n2. 修复「之后再按 Win+Alt 没反应」——录音线程结束后未清空句柄，导致后续按键被防重复守卫挡掉。\n3. 保持：按住说话提示、麦克风端点实测选择（跳过 DirectSound 全零/WDM-KS 打不开）、后台预加载模型、响度归一化。",
   "assets": {}
 }

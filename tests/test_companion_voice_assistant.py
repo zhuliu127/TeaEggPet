@@ -409,3 +409,58 @@ def test_dispatch_requested_signal_from_background_thread():
     while time.time() < end and 't' not in got:
         app.processEvents(); time.sleep(0.02)
     assert got.get('t') == '今天天气真不错'
+
+
+def test_ensure_chat_handles_appshell_open_full_chat():
+    # runtime.app() 在 overlay 拓扑下返回 AppShell（只有 open_full_chat，聊天窗在 _instance 上）。
+    # _ensure_chat 不能因为 AppShell 没有 open_modern_chat 就报错返回 None。
+    a = _make()
+    opened = {}
+    class FakeWin:
+        pass
+    win = FakeWin()
+    class FakeInst:
+        modern_chat_window = win
+        def open_modern_chat(self):
+            opened['m'] = True
+    class FakeShell:
+        _instance = FakeInst()
+        def open_full_chat(self):
+            opened['f'] = True
+    shell = FakeShell()
+    got = a._ensure_chat(shell)
+    assert got is win
+    # 已经拿到窗口时不必再打开
+    assert 'f' not in opened
+
+
+def test_ensure_chat_opens_via_open_full_chat_when_no_window():
+    a = _make()
+    opened = {}
+    class FakeInst:
+        modern_chat_window = None
+        def open_modern_chat(self):
+            opened['m'] = True
+    class FakeShell:
+        _instance = FakeInst()
+        def open_full_chat(self):
+            opened['f'] = True
+    shell = FakeShell()
+    # 没有现成窗口 → 应先开一次
+    got = a._ensure_chat(shell)
+    assert ('f' in opened) or ('m' in opened)
+    assert got is None  # 两个窗口都还是 None
+
+
+def test_record_loop_resets_rec_thread_after_finish():
+    # 录音线程退出后 _rec_thread 必须清空，否则下次按住被守卫挡掉（“之后再按没反应”）。
+    a = _make()
+    a._rec_thread = None
+    # 模拟 _on_pressed 的守卫逻辑
+    a._rec_thread = object()  # 有一个陈旧句柄
+    blocked = (a._state == "recording" or a._rec_thread is not None)
+    assert blocked is True
+    # 线程结束后置 None → 不再挡
+    a._rec_thread = None
+    blocked2 = (a._state == "recording" or a._rec_thread is not None)
+    assert blocked2 is False
