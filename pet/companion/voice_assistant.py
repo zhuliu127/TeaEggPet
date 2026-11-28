@@ -870,8 +870,6 @@ class VoiceAssistant(QObject):
             log.info("录音结束：时长 %.2fs rms=%.4f", audio.shape[0] / SAMPLE_RATE, rms)
 
             # 电平太低基本是没说话/麦克风静音——直接提示，别硬塞给 Whisper 产生幻听。
-            # v1.4.34：门槛从 0.004 降到 0.003（BOYA 实测正常说话 rms 0.05~0.26，太小的
-            # 阈值只会误杀轻声细语；低于 0.003 基本确实是没声音）。
             if rms < 0.003:
                 self._set_state("idle")
                 self.status.emit(
@@ -879,19 +877,9 @@ class VoiceAssistant(QObject):
                     "按住「%s」时再大声点说～" % self.hotkey_combo())
                 return
 
-            # 高通去低频嗡声（提升低信噪比录音可懂度、减少繁体误识），再按峰值做响度归一化。
-            try:
-                raw_rms = rms
-                audio = _highpass(audio, SAMPLE_RATE)
-                rms = float(np.sqrt(np.mean(audio ** 2)) + 1e-9)
-                log.info("高通滤波：rms %.4f → %.4f", raw_rms, rms)
-            except Exception:  # noqa: BLE001
-                log.debug("高通滤波失败", exc_info=True)
-            peak = float(np.max(np.abs(audio))) + 1e-9
-            if peak < 0.9:
-                gain = min(0.9 / peak, 20.0)  # 最多放大 20 倍，避免把噪声也炸开
-                audio = (audio * gain).astype("float32")
-                log.info("录音归一化：peak %.4f → x%.2f", peak, gain)
+            # v1.4.35：用户要求「去掉所有额外音频处理，只保留降噪」。
+            # 这里不再做高通滤波、不再做峰值归一化（放大容易削波/放噪）。唯一的降噪就是
+            # 重采样里的抗混叠低通（_resample_to_16k 内部 FIR 低通），属于采样率转换的必需步骤。
 
             if self._engine is None and not self._load_models():
                 self._set_state("idle")
@@ -900,29 +888,24 @@ class VoiceAssistant(QObject):
             from . import asr
 
             beam = max(1, int(self._cfg("companion_whisper_beam", 2) or 2))
-            # vad_filter=False：录音已经很短、且已按需门控，Whisper 内部 VAD 常把短的整句判成静音返回空。
-            # v1.4.34：第一遍不传 initial_prompt（最不易触发「请用简体中文输出」式回声）；
-            # 若一段有声但没出文本，asr.transcribe 内部再用极简 prompt 兜底。
+            # vad_filter=False：录音已经很短，交给 Whisper 直接识别（不再叠内部 VAD 以免吞句）。
+            # 不传 initial_prompt（避免被复述成回声）。
             text = asr.transcribe(self._engine, audio, language="zh",
                                   vad_filter=False, beam_size=beam,
                                   initial_prompt=None)
-            # v1.4.34：不再靠 initial_prompt 逼简体（易被 whisper 复述成「请用简体中文输出」），
-            # 改为识别后做繁→简转换。中文 whisper 模型常输出繁体，转成简体后观感才对。
+            # v1.4.35：音频处理全部去掉（只剩重采样的抗混叠降噪）。这里只对「文字」做繁→简转换，
+            # 不动音频——中文 whisper 模型原生常输出繁体，转简体纯属显示层，用户已确认保留。
             text = _to_simplified(text or "")
             self.heard.emit(text or "")
             text = (text or "").strip()
             log.info("识别结果：%r", text)
             used_dev = self._rec_dev_index
-            if (not text or _looks_like_subtitle_junk(text)
-                    or _is_prompt_echo(text) or _looks_hallucinated(text)):
+            # v1.4.35：不再做任何「字幕套话/回声/幻听」文本过滤——用户明确要求只需降噪，
+            # 识别到什么就发什么，避免误杀正常话语。只处理「完全空」这一种情况。
+            if not text:
                 self._set_state("idle")
-                # 只在「完全没识别到」时才降级端点；提示词回声/幻听说明端点其实有声音、
-                # 只是这段太轻或没说话，不应该因此判定端点坏、更不能每段都降级。
-                if not text:
-                    self._demote_device(used_dev)
-                    self.status.emit("（没听清）再按住「%s」说一遍～" % self.hotkey_combo())
-                else:
-                    self.status.emit("（这段没听清）再按住说一遍试试～")
+                self._demote_device(used_dev)
+                self.status.emit("（没听清）再按住「%s」说一遍～" % self.hotkey_combo())
                 return
             # 识别成功 → 记住这个端点，下次优先用它
             if used_dev is not None:
@@ -938,9 +921,8 @@ class VoiceAssistant(QObject):
 
     def _dispatch(self, text: str) -> None:
         """在 GUI 线程里按内容派发：指令 / 普通对话。"""
-        # 兜底：防止 initial_prompt 回声/字幕套话幻听漏网送进对话
-        if _is_prompt_echo(text) or _looks_like_subtitle_junk(text):
-            log.info("丢弃疑似提示词回声/幻听：%r", text)
+        # v1.4.35：不再做回声/幻听文本过滤，识别到什么就派发什么。
+        if not (text or "").strip():
             self._set_state("idle")
             return
         if self._state == "confirm":

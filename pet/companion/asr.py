@@ -524,56 +524,27 @@ def transcribe(
     """把 numpy float32 / int16 单声道音频转成文字（纯文本，去空白）。
 
     ``audio`` 需 16kHz 单声道（numpy float32，范围 -1..1）。
-    ``no_speech_threshold``：whisper 判定「这段是无语音」的概率阈值，超过就丢弃该段，
-    避免在静音/噪声上幻听（如把底噪听成「三星火」）。
 
-    抗「提示词回声」关键点：``condition_on_previous_text=False`` 已关闭上下文续写，
-    但 whisper 仍可能在静音段把 ``initial_prompt`` 当正文吐出来——因此调用方应尽量
-    不传 initial_prompt，或传很简短的引导。此外用 ``temperature`` 回退链配合
-    ``compression_ratio_threshold``，遇到「复读/复述」的高压缩比输出即视为无效。
+    v1.4.35：用户要求「去掉所有额外处理，只保留降噪」。这里不再做任何逐段过滤
+    （不按 no_speech_prob 丢段、不按 compression_ratio 丢段），Whisper 识别到
+    什么就直接返回什么，避免误杀正常话语。降噪已在录音重采样阶段完成。
     """
-    def _run(prompt, temp):
-        segs, _info = engine.transcribe(
-            audio,
-            language=language or "zh",
-            beam_size=int(beam_size or 1),
-            vad_filter=bool(vad_filter),
-            condition_on_previous_text=False,
-            initial_prompt=prompt or None,
-            no_speech_threshold=float(no_speech_threshold),
-            compression_ratio_threshold=2.4,
-            temperature=temp,
-        )
-        parts = []
-        had_speech = False
-        for seg in segs:
-            try:
-                nsp = float(getattr(seg, "no_speech_prob", 0.0) or 0.0)
-                cr = float(getattr(seg, "compression_ratio", 1.0) or 1.0)
-            except Exception:  # noqa: BLE001
-                nsp, cr = 0.0, 1.0
-            # 丢弃「基本无语音」的段（幻听多来自这种段）。
-            if nsp > no_speech_threshold:
-                continue
-            # 压缩比过高 = 复读/复述型输出（含提示词回声），丢弃。
-            if cr > 2.4:
-                continue
-            if (seg.text or "").strip():
-                had_speech = True
-                parts.append(seg.text)
-        return "".join(parts).strip(), had_speech
-
-    # 第一遍：不传 initial_prompt（最不容易触发回声）。
-    text, had_speech = _run(None, 0.0)
-    if text:
-        return text
-    # 第二遍（仅当第一遍有语音活动但没出文本、且提供了 prompt）：带 prompt 用略高温度再试，
-    # 让模型走「重采样纠错」路径，减少简单复述。
-    if had_speech and initial_prompt:
-        text2, _ = _run(initial_prompt, 0.2)
-        if text2:
-            return text2
-    return text
+    segs, _info = engine.transcribe(
+        audio,
+        language=language or "zh",
+        beam_size=int(beam_size or 1),
+        vad_filter=bool(vad_filter),
+        condition_on_previous_text=False,
+        initial_prompt=initial_prompt or None,
+        no_speech_threshold=float(no_speech_threshold),
+        compression_ratio_threshold=2.4,
+        temperature=0.0,
+    )
+    parts = []
+    for seg in segs:
+        if (seg.text or "").strip():
+            parts.append(seg.text)
+    return "".join(parts).strip()
 
 
 __all__ = [
