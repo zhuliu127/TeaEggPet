@@ -169,14 +169,14 @@ def test_start_returns_false_when_disabled():
 
 
 def test_start_does_not_load_model_synchronously(monkeypatch):
-    """start() 只装钩子、立即返回，绝不在调用线程加载模型。"""
-    import sys
+    """start() 只装钩子、立即返回；模型在后台线程预热，绝不在调用线程同步加载。"""
+    import threading
 
-    loaded = {"in_caller": False}
+    loaded = {"thread": None}
     a = _make({"companion_voice_enabled": True, "companion_voice_hotkey": "win+alt"})
 
     def fake_load():
-        loaded["in_caller"] = True
+        loaded["thread"] = threading.current_thread().name
         return True
 
     a._load_models = fake_load  # type: ignore[assignment]
@@ -196,8 +196,15 @@ def test_start_does_not_load_model_synchronously(monkeypatch):
     monkeypatch.setattr(va, "PushToTalkHotkey", _FakePtt)
     ok = a.start()
     assert ok is True
-    assert loaded["in_caller"] is False
     assert a.state == "idle"
+    # 等在后台预热线程里跑完 fake_load，确认它不是在主(调用)线程里同步执行的
+    for _ in range(100):
+        if loaded["thread"] is not None:
+            break
+        import time as _t
+        _t.sleep(0.01)
+    assert loaded["thread"] is not None
+    assert loaded["thread"] != threading.main_thread().name
     a.stop()
 
 

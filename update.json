@@ -1,6 +1,6 @@
 {
-  "version": "1.4.23",
-  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases/tag/v1.4.23",
-  "notes": "修复 v1.4.22 的一个回归：设置页「测试麦克风」按钮报 module has no attribute probe_mic（改推挽式时漏把麦克风测试探针加回去）。现已补回 probe_mic / list_input_devices，点「测试麦克风」会录制 3 秒、显示实时电平条并给出是否正常收音的结论；同名多端点会自动挑 WASAPI 那个能收听的。",
+  "version": "1.4.24",
+  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases/tag/v1.4.24",
+  "notes": "修复「按住 Win+Alt 说完话没反应」：\n1) 识别模型改为启动时后台预加载——之前第一次按住说话时模型还在加载（十几秒），这段时间的录音被整个吞掉，松开后自然没反应；\n2) 录音做了响度归一化（小声/离得远也能识别），并关闭 Whisper 内部 VAD（它常把短的整句判成静音返回空）；\n3) 电平过低（基本没收到声音/麦静音）时直接提示，不再硬塞给模型产生时幻听。现在按住说话→松开→识别成文字→自动发进 AI 对话→语音回复。",
   "assets": {}
 }

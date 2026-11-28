@@ -354,6 +354,8 @@ class VoiceAssistant(QObject):
         self._hotkey = hk
         self._set_state("idle")
         self.status.emit("语音助手已就绪：按住「%s」说话，松开我就识别并回复～" % self.hotkey_combo())
+        # 后台预加载识别模型：否则第一次按住说话时模型还在加载，音频会被丢光。
+        self._warmup_model()
         return True
 
     def stop(self) -> None:
@@ -372,6 +374,20 @@ class VoiceAssistant(QObject):
         self.stop()
         if self._enabled():
             self.start()
+
+    def _warmup_model(self) -> None:
+        """后台线程预加载识别模型（不阻塞 start()；不占麦克风）。"""
+        if self._engine is not None:
+            return
+
+        def _go():
+            try:
+                self.status.emit("正在准备识别模型…")
+                self._load_models()
+            except Exception:  # noqa: BLE001
+                log.exception("预加载识别模型失败")
+
+        threading.Thread(target=_go, name="VoiceModelWarmup", daemon=True).start()
 
     # ------------------------------------------------------------ 钩子回调（后台线程）
     def _on_pressed(self) -> None:
@@ -403,15 +419,9 @@ class VoiceAssistant(QObject):
         import numpy as np
         import sounddevice as sd
 
-        sent_status = False
         try:
-            # 若模型还没加载（第一批），顺手加载（慢没关系，录音先进行，不阻塞）
-            if self._engine is None:
-                try:
-                    self.status.emit("正在准备识别模型…")
-                    self._load_models()
-                except Exception:  # noqa: BLE001
-                    log.exception("加载模型失败")
+            # 不在这里加载模型（start() 已后台预热）。若还没就绪，录音照常先进行，
+            # 识别阶段再等模型——避免模型加载的十几秒把用户说的话整个吞掉。
             dev = self._pick_device()
             dvinfo = sd.query_devices(dev) if dev is not None else sd.query_devices(kind="input")
             sr = int(dvinfo.get("default_samplerate") or SAMPLE_RATE)
@@ -516,6 +526,21 @@ class VoiceAssistant(QObject):
             rms = float(np.sqrt(np.mean(audio ** 2)) + 1e-9)
             log.info("录音结束：时长 %.2fs rms=%.4f", audio.shape[0] / SAMPLE_RATE, rms)
 
+            # 电平太低基本是没说话/麦克风静音——直接提示，别硬塞给 Whisper 产生幻听。
+            if rms < 0.004:
+                self._set_state("idle")
+                self.status.emit(
+                    "（没收到声音）麦克风电平太低，请确认没静音、选对麦克风，"
+                    "按住「%s」时再大声点说～" % self.hotkey_combo())
+                return
+
+            # 响度归一化：把峰值拉到 ~0.9，让小声/偏远的说话也能被识别（否则 VAD 全切掉返回空）。
+            peak = float(np.max(np.abs(audio))) + 1e-9
+            if peak < 0.9:
+                gain = min(0.9 / peak, 20.0)  # 最多放大 20 倍，避免把噪声也炸开
+                audio = (audio * gain).astype("float32")
+                log.info("录音归一化：peak %.4f → x%.2f", peak, gain)
+
             if self._engine is None and not self._load_models():
                 self._set_state("idle")
                 return
@@ -523,8 +548,9 @@ class VoiceAssistant(QObject):
             from . import asr
 
             beam = int(self._cfg("companion_whisper_beam", 1) or 1)
+            # vad_filter=False：录音已经很短、且已按需门控，Whisper 内部 VAD 常把短的整句判成静音返回空。
             text = asr.transcribe(self._engine, audio, language="zh",
-                                  vad_filter=True, beam_size=beam)
+                                  vad_filter=False, beam_size=beam)
             self.heard.emit(text or "")
             text = (text or "").strip()
             log.info("识别结果：%r", text)
