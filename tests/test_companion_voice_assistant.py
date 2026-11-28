@@ -308,6 +308,24 @@ def test_highpass_attenuates_dc_and_lowfreq():
     assert va._highpass(np.zeros(0, dtype=np.float32)).shape[0] == 0
 
 
+def test_is_prompt_echo_detects_initial_prompt_leak():
+    # v1.4.33：whisper 在静音/低信噪比段会把 initial_prompt 复述出来，必须识别并丢弃，
+    # 否则「请用简体中文输出。」会被当成用户的话送进 AI 对话。
+    assert va._is_prompt_echo("请用简体中文输出。") is True
+    assert va._is_prompt_echo("以下是普通话的句子，请用简体中文输出。") is True
+    assert va._is_prompt_echo("用简体中文输出") is True
+    assert va._is_prompt_echo("简体中文") is True
+    # 正常用户话不应被误判
+    assert va._is_prompt_echo("今天天气怎么样") is False
+    assert va._is_prompt_echo("帮我订个闹钟") is False
+    assert va._is_prompt_echo("") is False
+
+
+def test_subtitle_junk_filters_prompt_echo_phrases():
+    assert va._looks_like_subtitle_junk("请用简体中文输出。") is True
+    assert va._looks_like_subtitle_junk("以下是普通话的句子") is True
+
+
 def test_subtitle_junk_filters_new_phrases():
     # v1.4.25：实测会出现「字幕by索兰娅」「字幕製作人Zither Harp」这类幻听，必须过滤
     assert va._looks_like_subtitle_junk("字幕by索兰娅") is True

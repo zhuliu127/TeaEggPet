@@ -117,6 +117,9 @@ _HALLUCINATION_PHRASES = (
     "bilibili", "哔哩哔哩", "字幕由", "明镜与点点", "未经许可",
     "索兰娅", "zither", "harper", "harps", "subtitle", "subtitles",
     "amara", "音译", "校对", "自动生成", "製作人", "制作人",
+    # v1.4.33：initial_prompt 在静音/低信噪比段会被 whisper 复述出来，必须过滤，
+    # 否则「请用简体中文输出。」会被当成用户说的话送进 AI 对话。
+    "请用简体", "简体中文", "以下是普通话", "普通话的句子", "用简体",
 )
 
 
@@ -126,6 +129,21 @@ def _looks_like_subtitle_junk(text: str) -> bool:
         return True
     for phrase in _HALLUCINATION_PHRASES:
         if _norm(phrase) and _norm(phrase) in t:
+            return True
+    return False
+
+
+def _is_prompt_echo(text: str) -> bool:
+    """检测 whisper 把 initial_prompt 复述出来的情况（静音/低信噪比时常发生）。
+
+    只要识别结果里出现提示词的显著片段（如「请用简体」「以下是普通话」「用简体中文输出」），
+    就认为它是提示词回声、不是用户真的说的话，必须丢弃。
+    """
+    t = _norm(text)
+    if not t:
+        return False
+    for frag in ("请用简体", "简体中文输出", "以下是普通话", "普通话的句子", "用简体中文", "简体中文"):
+        if _norm(frag) in t:
             return True
     return False
 
@@ -824,14 +842,16 @@ class VoiceAssistant(QObject):
             text = (text or "").strip()
             log.info("识别结果：%r", text)
             used_dev = self._rec_dev_index
-            if not text or _looks_like_subtitle_junk(text) or _looks_hallucinated(text):
-                # 这个端点没听清 / 出字幕套话幻听：把它降级，下次按住说话换下一个候选端点
-                self._demote_device(used_dev)
+            if (not text or _looks_like_subtitle_junk(text)
+                    or _is_prompt_echo(text) or _looks_hallucinated(text)):
                 self._set_state("idle")
+                # 只在「完全没识别到」时才降级端点；提示词回声/幻听说明端点其实有声音、
+                # 只是这段太轻或没说话，不应该因此判定端点坏、更不能每段都降级。
                 if not text:
+                    self._demote_device(used_dev)
                     self.status.emit("（没听清）再按住「%s」说一遍～" % self.hotkey_combo())
                 else:
-                    self.status.emit("（这段没听清，换了个麦克风，再说一次试试）")
+                    self.status.emit("（这段没听清）再按住说一遍试试～")
                 return
             # 识别成功 → 记住这个端点，下次优先用它
             if used_dev is not None:
@@ -847,6 +867,11 @@ class VoiceAssistant(QObject):
 
     def _dispatch(self, text: str) -> None:
         """在 GUI 线程里按内容派发：指令 / 普通对话。"""
+        # 兜底：防止 initial_prompt 回声/字幕套话幻听漏网送进对话
+        if _is_prompt_echo(text) or _looks_like_subtitle_junk(text):
+            log.info("丢弃疑似提示词回声/幻听：%r", text)
+            self._set_state("idle")
+            return
         if self._state == "confirm":
             self._handle_confirm(text)
             return
