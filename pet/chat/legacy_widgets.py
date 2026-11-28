@@ -1175,6 +1175,14 @@ class ChatWindow(QDialog):
         else:
             self._focus_chat()
 
+    @staticmethod
+    def _notice_preview(text: str, limit: int = 120) -> str:
+        """把 AI 回复正文压成适合系统通知展示的一行摘要。"""
+        s = " ".join(str(text or "").split())
+        if not s:
+            return "AI 已回复完成，点击查看。"
+        return s if len(s) <= limit else s[: limit - 1] + "…"
+
     def _show_system_notice(self, title: str, message: str, *, on_click=None) -> None:
         """仅在聊天窗口不是当前活动窗口时弹系统通知；点击默认跳回本窗口。"""
         if (self._system_notifier is None
@@ -1245,7 +1253,7 @@ class ChatWindow(QDialog):
         self._refresh_sessions()
         self._reset()
         self.pet_link.success()
-        self._show_system_notice("对话完成", "AI 已回复完成，点击查看。")
+        self._show_system_notice("对话完成", self._notice_preview(text))
         if follow_output:
             self._bottom()
 
