@@ -49,7 +49,53 @@ CANCEL_WORDS = ["不用", "算了", "取消", "不要", "别", "不了", "否", 
 # 单段录音上限：按住超过这个时长自动停止并识别（防止忘记松手一直占着麦克风）。
 MAX_RECORD_SEC = 30.0
 
+# 简体中文引导 prompt：faster-whisper 的中文模型训练数据偏繁体，不加引导常输出繁体
+# （用户看到「電池的社會」「終於成功了」即为繁体误识），引导后能稳定输出简体。
+ZH_SIMPLIFIED_PROMPT = "以下是普通话的句子，请用简体中文输出。"
+
+# 高通滤波截止频率：去掉 80Hz 以下的低频嗡声/电流声（空调、风扇、桌面共振多在 60Hz 附近），
+# 能明显提升低信噪比录音的可懂度，还顺带减少繁体输出。
+HIGHPASS_FC = 80.0
+
 _PUNCT = re.compile(r"[\s，。！？、,.!?\-—…~·\"'“”‘’《》()（）\[\]【】:：;；]+")
+
+
+def _biquad_highpass(x, sr: int, fc: float):
+    """自包含二阶 Butterworth 高通（RBJ biquad），无需 scipy。"""
+    import numpy as np
+
+    a = np.asarray(x, dtype=np.float32).reshape(-1)
+    if a.shape[0] == 0:
+        return a
+    w0 = 2.0 * np.pi * float(fc) / float(sr)
+    cosw0 = float(np.cos(w0))
+    sinw0 = float(np.sin(w0))
+    # Q = 1/sqrt(2)（Butterworth）
+    alpha = sinw0 / (2.0 * (1.0 / np.sqrt(2.0)))
+    b0 = (1.0 + cosw0) / 2.0
+    b1 = -(1.0 + cosw0)
+    b2 = (1.0 + cosw0) / 2.0
+    a0 = 1.0 + alpha
+    a1 = -2.0 * cosw0
+    a2 = 1.0 - alpha
+    b0 /= a0; b1 /= a0; b2 /= a0; a1 /= a0; a2 /= a0
+    y = np.empty_like(a)
+    x1 = x2 = y1 = y2 = 0.0
+    for i in range(a.shape[0]):
+        v = float(a[i])
+        out = b0 * v + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        x2 = x1; x1 = v; y2 = y1; y1 = out; y[i] = out
+    return y.astype(np.float32)
+
+
+def _highpass(x, sr: int = SAMPLE_RATE, fc: float = HIGHPASS_FC):
+    """二阶 butterworth 高通，去低频噪声（自包含实现，不依赖 scipy）。"""
+    try:
+        return _biquad_highpass(x, sr, fc)
+    except Exception:  # noqa: BLE001
+        import numpy as np
+
+        return np.asarray(x, dtype=np.float32).reshape(-1)
 
 
 def _norm(text: str) -> str:
@@ -90,6 +136,15 @@ def _looks_hallucinated(text: str) -> bool:
     if not t:
         return True
     n = len(t)
+    if n < 4:
+        return False
+    # 短文本：整句就是同一片段重复 ≥2 次（如「三星火三星火」「小鱼小鱼」），几乎必是低质量
+    # 音频上的幻听/复读——直接判幻听，别送进对话。
+    for seg_len in (2, 3, 4):
+        if n == seg_len * 2 and n >= 4:
+            half = t[:seg_len]
+            if half and t[seg_len:] == half:
+                return True
     if n < 8:
         return False
     for seg_len in (2, 3, 4):
@@ -131,13 +186,40 @@ def _voiced_ratio(x, frame: int = 480) -> float:
     return float(np.mean(energies > peak * 0.25))
 
 
+def _fir_lowpass(x, cutoff_hz: float, sr: int, taps: int = 63):
+    """自包含窗函数法 FIR 低通（Hamming 窗），用于降采样前抗混叠。"""
+    import numpy as np
+
+    a = np.asarray(x, dtype=np.float32).reshape(-1)
+    if a.shape[0] == 0:
+        return a
+    fc = max(1e-4, min(0.499, float(cutoff_hz) / float(sr)))
+    n = np.arange(taps, dtype=np.float64) - (taps - 1) / 2.0
+    h = 2.0 * fc * np.sinc(2.0 * fc * n)
+    h *= np.hamming(taps)
+    h /= np.sum(h) + 1e-12
+    # 'same' 卷积
+    y = np.convolve(a.astype(np.float64), h, mode="same")
+    return y.astype(np.float32)
+
+
 def _resample_to_16k(x, src_sr: int):
-    """把任意采样率的单声道 float32 数组线性插值到 16kHz。"""
+    """把任意采样率的单声道 float32 数组重采样到 16kHz。
+
+    整数倍降采样（如 48k→16k = 3:1）先 FIR 低通抗混叠再抽取，避免线性插值的
+    高频混叠拉低 ASR 准确率；非整数倍退回线性插值。
+    """
     import numpy as np
 
     a = np.asarray(x, dtype=np.float32).reshape(-1)
     if src_sr == SAMPLE_RATE or a.shape[0] == 0:
         return a
+    ratio = float(src_sr) / float(SAMPLE_RATE)
+    if abs(ratio - round(ratio)) < 1e-6 and round(ratio) >= 2:
+        # 抗混叠低通到目标奈奎斯特（8kHz）附近，再等间隔抽取
+        lp = _fir_lowpass(a, SAMPLE_RATE * 0.5 * 0.9, src_sr)
+        step = int(round(ratio))
+        return np.ascontiguousarray(lp[::step]).astype(np.float32)
     need = int(round(a.shape[0] * SAMPLE_RATE / src_sr))
     if need <= 0:
         return np.zeros(0, dtype=np.float32)
@@ -270,6 +352,18 @@ def probe_mic(device_name: str = "", seconds: float = 3.0, on_level=None) -> dic
     })
     if not result["ok"]:
         result["error"] = "麦克风几乎没电平（可能静音/选错设备/硬件没在收音）"
+    else:
+        # 电平提示：识别准确率很依赖录音电平；peak 太低说明说话太小/离麦太远，
+        # 在低信噪比下 whisper 容易把话听成乱码（如「三星火」）。
+        if peak < 0.05:
+            result["level_hint"] = "电平太低：请靠近麦克风或调大系统麦克风音量后重试"
+            result["level"] = "low"
+        elif peak < 0.15:
+            result["level_hint"] = "电平偏小：靠近一点说话识别更准"
+            result["level"] = "mid"
+        else:
+            result["level_hint"] = "电平正常"
+            result["level"] = "good"
     return result
 
 
@@ -677,12 +771,9 @@ class VoiceAssistant(QObject):
                 if sr == SAMPLE_RATE:
                     pieces.append(raw)
                 else:
-                    n = raw.shape[0]
-                    need = int(round(n * SAMPLE_RATE / sr))
-                    if need > 0:
-                        src = np.linspace(0.0, 1.0, n, endpoint=False, dtype=np.float32)
-                        dst = np.linspace(0.0, 1.0, need, endpoint=False, dtype=np.float32)
-                        pieces.append(np.interp(dst, src, raw).astype(np.float32))
+                    rs = _resample_to_16k(raw, sr)
+                    if rs.shape[0] > 0:
+                        pieces.append(rs)
             if not pieces:
                 self._set_state("idle")
                 return
@@ -703,7 +794,14 @@ class VoiceAssistant(QObject):
                     "按住「%s」时再大声点说～" % self.hotkey_combo())
                 return
 
-            # 响度归一化：把峰值拉到 ~0.9，让小声/偏远的说话也能被识别（否则 VAD 全切掉返回空）。
+            # 高通去低频嗡声（提升低信噪比录音可懂度、减少繁体误识），再按峰值做响度归一化。
+            try:
+                raw_rms = rms
+                audio = _highpass(audio, SAMPLE_RATE)
+                rms = float(np.sqrt(np.mean(audio ** 2)) + 1e-9)
+                log.info("高通滤波：rms %.4f → %.4f", raw_rms, rms)
+            except Exception:  # noqa: BLE001
+                log.debug("高通滤波失败", exc_info=True)
             peak = float(np.max(np.abs(audio))) + 1e-9
             if peak < 0.9:
                 gain = min(0.9 / peak, 20.0)  # 最多放大 20 倍，避免把噪声也炸开
@@ -716,10 +814,12 @@ class VoiceAssistant(QObject):
 
             from . import asr
 
-            beam = int(self._cfg("companion_whisper_beam", 1) or 1)
+            beam = max(1, int(self._cfg("companion_whisper_beam", 2) or 2))
             # vad_filter=False：录音已经很短、且已按需门控，Whisper 内部 VAD 常把短的整句判成静音返回空。
+            # initial_prompt 引导简体（否则中文模型常输出繁体，观感像「识别错」）。
             text = asr.transcribe(self._engine, audio, language="zh",
-                                  vad_filter=False, beam_size=beam)
+                                  vad_filter=False, beam_size=beam,
+                                  initial_prompt=ZH_SIMPLIFIED_PROMPT)
             self.heard.emit(text or "")
             text = (text or "").strip()
             log.info("识别结果：%r", text)

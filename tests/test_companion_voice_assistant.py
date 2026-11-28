@@ -264,8 +264,15 @@ def test_looks_hallucinated_rejects_repeated():
 
 
 def test_looks_hallucinated_accepts_normal():
-    assert va._looks_hallucinated("小鱼小鱼") is False
+    # 「来啦来啦，想聊点什么呀？」是正常句子（重复片段后还有其它内容），不算幻听
     assert va._looks_hallucinated("来啦来啦，想聊点什么呀？") is False
+    assert va._looks_hallucinated("今天天气真不错") is False
+
+
+def test_looks_hallucinated_rejects_short_exact_repeat():
+    # 整句恰好是同一短片段重复两次（低质量音频复读幻听），如「三星火三星火」「小姨小姨」
+    assert va._looks_hallucinated("三星火三星火") is True
+    assert va._looks_hallucinated("小姨小姨") is True
 
 
 def test_zero_crossing_rate_noise_vs_tone():
@@ -285,6 +292,20 @@ def test_voiced_ratio_speech_like_vs_flat():
     burst = np.concatenate([rng.standard_normal(8000).astype(np.float32) * 0.05,
                             np.zeros(8000, dtype=np.float32)])
     assert va._voiced_ratio(speechlike) >= va._voiced_ratio(burst)
+
+
+def test_highpass_attenuates_dc_and_lowfreq():
+    import numpy as np
+    # 直流 + 20Hz 低频分量应被高通显著衰减；高频 1kHz 基本保留
+    t = np.arange(16000) / 16000.0
+    low = (0.5 * np.ones_like(t) + 0.4 * np.sin(2 * np.pi * 20 * t)).astype(np.float32)
+    hp = va._highpass(low, 16000)
+    assert float(np.mean(np.abs(hp))) < float(np.mean(np.abs(low))) * 0.5
+    hi = (0.4 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)
+    hp_hi = va._highpass(hi, 16000)
+    # 高频能量大致保留（不衰减到一半以下）
+    assert float(np.sqrt(np.mean(hp_hi ** 2))) > float(np.sqrt(np.mean(hi ** 2))) * 0.6
+    assert va._highpass(np.zeros(0, dtype=np.float32)).shape[0] == 0
 
 
 def test_subtitle_junk_filters_new_phrases():

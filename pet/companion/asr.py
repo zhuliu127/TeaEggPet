@@ -519,10 +519,13 @@ def transcribe(
     initial_prompt: str | None = None,
     vad_filter: bool = True,
     beam_size: int = 1,
+    no_speech_threshold: float = 0.85,
 ) -> str:
     """把 numpy float32 / int16 单声道音频转成文字（纯文本，去空白）。
 
     ``audio`` 需 16kHz 单声道（numpy float32，范围 -1..1）。
+    ``no_speech_threshold``：whisper 判定「这段是无语音」的概率阈值，超过就丢弃该段，
+    避免在静音/噪声上幻听（如把底噪听成「三星火」）。
     """
     segs, _info = engine.transcribe(
         audio,
@@ -531,8 +534,19 @@ def transcribe(
         vad_filter=bool(vad_filter),
         condition_on_previous_text=False,
         initial_prompt=initial_prompt or None,
+        no_speech_threshold=float(no_speech_threshold),
+        compression_ratio_threshold=2.4,
     )
-    return "".join(seg.text for seg in segs).strip()
+    parts = []
+    for seg in segs:
+        # 丢弃被 whisper 判为「基本无语音」的段（幻听多来自这种段）。
+        try:
+            if float(getattr(seg, "no_speech_prob", 0.0) or 0.0) > no_speech_threshold:
+                continue
+        except Exception:  # noqa: BLE001
+            pass
+        parts.append(seg.text)
+    return "".join(parts).strip()
 
 
 __all__ = [

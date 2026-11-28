@@ -1068,9 +1068,11 @@ class CompanionSettingsDialog(QDialog):
             ok = bool(res.get("ok"))
             if ok:
                 self.voice_meter.setValue(100)
+                hint = res.get("level_hint") or ""
+                tail = f"\n{hint}" if hint else ""
                 self.voice_test_label.setText(
                     f"✅ 麦克风正常！峰值 {res.get('peak', 0):.3f}，平均 {res.get('rms', 0):.3f}"
-                    f"（设备 {res.get('device')}，{res.get('sr')}Hz）")
+                    f"（设备 {res.get('device')}，{res.get('sr')}Hz）{tail}")
             else:
                 self.voice_meter.setValue(0)
                 self.voice_test_label.setText(
