@@ -115,6 +115,33 @@ def _combo_left(widget) -> None:
         pass
 
 
+def _list_input_devices() -> list:
+    """列出可用输入设备（麦克风），**按名字去重**，返回 [(显示名, 配置值)]。
+
+    同一支物理麦克风（如 BOYA CastMic G30）在 Windows 里会被 MME、DirectSound、
+    WASAPI、WDM-KS 等多个 Host API 各自登记一次，query_devices() 就读出 N 个同名设备。
+    这里按设备名去重，一支物理麦克风只显示一次；真实可用端点由
+    voice_assistant._pick_device() 在录音时按 Host API 优先级实测挑选，所以下拉里
+    只要保留名字即可（配置值仍是名字）。
+    """
+    result: list = []
+    try:
+        import sounddevice as sd
+
+        for dev in sd.query_devices():
+            if int(dev.get("max_input_channels", 0)) <= 0:
+                continue
+            name = str(dev.get("name", "")).strip()
+            if not name:
+                continue
+            if any(name == existing for existing, _ in result):
+                continue
+            result.append((name, name))
+    except Exception:  # noqa: BLE001
+        pass
+    return result
+
+
 def _hbox(*widgets, stretch_at: int = 0) -> QHBoxLayout:
     """一行摆几个控件；``stretch_at`` 指定哪一个吃掉多余宽度（-1 = 都不吃）。"""
     box = QHBoxLayout()
@@ -898,14 +925,8 @@ class CompanionSettingsDialog(QDialog):
         self.voice_device = QComboBox()
         self.voice_device.setEditable(True)
         self.voice_device.addItem("（系统默认麦克风）", "")
-        try:
-            import sounddevice as sd
-
-            for dev in sd.query_devices():
-                if int(dev.get("max_input_channels", 0)) > 0:
-                    self.voice_device.addItem(str(dev.get("name", "")), str(dev.get("name", "")))
-        except Exception:  # noqa: BLE001
-            pass
+        for name, val in _list_input_devices():
+            self.voice_device.addItem(name, val)
         self.voice_device.setToolTip("选输入设备（麦克风）。系统默认通常就行")
         btn_dev = QPushButton("刷新设备")
         btn_dev.clicked.connect(self._refresh_voice_devices)
@@ -934,7 +955,7 @@ class CompanionSettingsDialog(QDialog):
         sep.setFrameShape(QFrame.Shape.HLine)
         form.addRow(sep)
 
-        # ---- Whisper 模型 ----
+        # ---- Qwen3-ASR 语音识别模型 ----
         # 说明当前**实际在用**的模型
         self.model_current_label = QLabel("")
         self.model_current_label.setWordWrap(True)
@@ -948,7 +969,7 @@ class CompanionSettingsDialog(QDialog):
             self.whisper_size.addItem(label, size)
         row.addWidget(self.whisper_size, 1)
         self.whisper_download_btn = QPushButton("下载模型")
-        self.whisper_download_btn.setToolTip("从国内镜像（hf-mirror.com）下载所选模型，无需翻墙")
+        self.whisper_download_btn.setToolTip("从魔搭（ModelScope）国内镜像下载所选 Qwen3-ASR 模型，无需翻墙")
         self.whisper_download_btn.clicked.connect(self._download_whisper_model)
         row.addWidget(self.whisper_download_btn)
         form.addRow("语音识别模型", self._wrap(row))
@@ -972,7 +993,7 @@ class CompanionSettingsDialog(QDialog):
 
         row = QHBoxLayout()
         self.whisper_path = QLineEdit()
-        self.whisper_path.setPlaceholderText("留空 = 用下载的模型；也可填自己下好的模型目录")
+        self.whisper_path.setPlaceholderText("留空 = 用下载的模型；也可填自己下好的 Qwen3-ASR 模型目录")
         btn_pick = QPushButton("选择…")
         btn_pick.clicked.connect(self._pick_whisper_path)
         btn_scan = QPushButton("自动搜索本机")
@@ -980,24 +1001,24 @@ class CompanionSettingsDialog(QDialog):
         row.addWidget(self.whisper_path, 1)
         row.addWidget(btn_pick)
         row.addWidget(btn_scan)
-        form.addRow("对话模型路径", self._wrap(row))
+        form.addRow("模型路径", self._wrap(row))
 
         self.whisper_local_list = QComboBox()
-        self.whisper_local_list.setToolTip("本机扫描到的模型，选中即填入上面的路径")
+        self.whisper_local_list.setToolTip("本机扫描到的 Qwen3-ASR 模型，选中即填入上面的路径")
         self.whisper_local_list.activated.connect(self._use_scanned_whisper)
         form.addRow("已有模型", self.whisper_local_list)
 
         row = QHBoxLayout()
         self.whisper_device = QComboBox()
-        self.whisper_device.addItem("CPU", "cpu")
-        self.whisper_device.addItem("GPU（CUDA，需已装显卡驱动）", "cuda")
+        self.whisper_device.addItem("CPU（推荐，稳定）", "cpu")
+        self.whisper_device.addItem("GPU（CUDA，有 NVIDIA 显卡可试，明显更快）", "cuda")
+        # 兼容旧配置：float32/int8 这些在 Qwen 下不再单独暴露，隐藏一个占位下拉。
         self.whisper_compute = QComboBox()
-        for text, data in (("int8（CPU 推荐）", "int8"), ("float16（GPU）", "float16"),
-                           ("int8_float16（GPU 省显存）", "int8_float16"), ("float32", "float32")):
+        for text, data in (("float32（CPU 推荐）", "float32"), ("float16（GPU）", "float16")):
             self.whisper_compute.addItem(text, data)
-        row.addWidget(QLabel("识别模型运行设备"))
+        self.whisper_compute.setVisible(False)
+        row.addWidget(QLabel("识别运行设备"))
         row.addWidget(self.whisper_device)
-        row.addWidget(self.whisper_compute)
         row.addStretch(1)
         form.addRow("性能", self._wrap(row))
 
@@ -1016,9 +1037,9 @@ class CompanionSettingsDialog(QDialog):
         form.addRow("", self._wrap(btn_row))
 
         hint = QLabel(
-            "小提示：按住「语音键」说话，松开后自动用本地 Whisper 识别并发送给 AI，"
+            "小提示：按住「语音键」说话，松开后自动用本地 Qwen3-ASR 识别并发送给 AI，"
             "回复会用语音念出来（需要先在上方「语音识别模型」下载/选择模型）。\n"
-            "模型下载走国内镜像；也能自己下 faster-whisper 模型后填路径或点「自动搜索本机」。")
+            "模型下载走魔搭（ModelScope）国内镜像；也能自己下好 Qwen3-ASR 模型后填路径或点「自动搜索本机」。")
         hint.setWordWrap(True)
         form.addRow("", hint)
         return page
@@ -1027,15 +1048,8 @@ class CompanionSettingsDialog(QDialog):
         current = self.voice_device.currentData()
         self.voice_device.clear()
         self.voice_device.addItem("（系统默认麦克风）", "")
-        try:
-            import sounddevice as sd
-
-            for dev in sd.query_devices():
-                if int(dev.get("max_input_channels", 0)) > 0:
-                    self.voice_device.addItem(str(dev.get("name", "")), str(dev.get("name", "")))
-        except Exception as exc:  # noqa: BLE001
-            self.voice_status.setText(f"读取麦克风列表失败：{exc}")
-            return
+        for name, val in _list_input_devices():
+            self.voice_device.addItem(name, val)
         idx = self.voice_device.findData(current)
         if idx >= 0:
             self.voice_device.setCurrentIndex(idx)
@@ -1101,7 +1115,7 @@ class CompanionSettingsDialog(QDialog):
         found = asr_mod.scan_local_models(extra)
         self.whisper_local_list.clear()
         if not found:
-            self.voice_status.setText("本机没找到可用的 Whisper 模型，点「下载模型」下一个吧")
+            self.voice_status.setText("本机没找到可用的 Qwen3-ASR 模型，点「下载模型」下一个吧")
             self.whisper_local_list.addItem("（没找到）", "")
             return
         for item in found:
@@ -1116,7 +1130,7 @@ class CompanionSettingsDialog(QDialog):
     def _download_whisper_model(self) -> None:
         from . import asr as asr_mod
 
-        size = self.whisper_size.currentData() or "base"
+        size = self.whisper_size.currentData() or "0.6B"
         store = self.store
         dest = str(store.whisper_models_dir())
         self.whisper_download_btn.setEnabled(False)
@@ -1126,7 +1140,7 @@ class CompanionSettingsDialog(QDialog):
         self.whisper_progress.setVisible(True)
         self.whisper_progress_label.setVisible(True)
         self.whisper_progress_label.setText(f"准备下载 {size} …")
-        self.voice_status.setText(f"开始下载 {size}（从国内镜像）…")
+        self.voice_status.setText(f"开始下载 {size}（从魔搭 ModelScope）…")
 
         def run():
             bridge = self._bridge
@@ -1569,14 +1583,14 @@ class CompanionSettingsDialog(QDialog):
             self.voice_device.setCurrentIndex(di)
         else:
             self.voice_device.setCurrentText(dev)
-        size = str(t.get("companion_whisper_model_size", "base") or "base")
+        size = str(t.get("companion_whisper_model_size", "0.6B") or "0.6B")
         si = self.whisper_size.findData(size)
         self.whisper_size.setCurrentIndex(max(0, si))
         self.whisper_path.setText(str(t.get("companion_whisper_model_path", "") or ""))
         wd = str(t.get("companion_whisper_device", "cpu") or "cpu")
         wi = self.whisper_device.findData(wd)
         self.whisper_device.setCurrentIndex(max(0, wi))
-        wc = str(t.get("companion_whisper_compute", "int8") or "int8")
+        wc = str(t.get("companion_whisper_compute", "float32") or "float32")
         ci = self.whisper_compute.findData(wc)
         self.whisper_compute.setCurrentIndex(max(0, ci))
         # 打开对话框就显示当前实际在用的模型
@@ -1640,10 +1654,10 @@ class CompanionSettingsDialog(QDialog):
             "companion_voice_enabled": bool(self.voice_enabled.isChecked()),
             "companion_voice_hotkey": self.voice_hotkey.text().strip() or "win+alt",
             "companion_voice_device": self.voice_device.currentData() or self.voice_device.currentText().strip(),
-            "companion_whisper_model_size": self.whisper_size.currentData() or "base",
+            "companion_whisper_model_size": self.whisper_size.currentData() or "0.6B",
             "companion_whisper_model_path": self.whisper_path.text().strip(),
             "companion_whisper_device": self.whisper_device.currentData() or "cpu",
-            "companion_whisper_compute": self.whisper_compute.currentData() or "int8",
+            "companion_whisper_compute": self.whisper_compute.currentData() or "float32",
         }
 
     def _on_save(self) -> None:

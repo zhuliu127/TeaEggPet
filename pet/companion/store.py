@@ -106,15 +106,15 @@ DEFAULTS: dict[str, Any] = {
     "companion_voice_sleep_word": "",          # 旧字段：结束词（已弃用，保留兼容旧配置）
     "companion_voice_dialog_timeout": 60,      # 旧字段：对话空闲超时（推挽式不再使用）
     "companion_voice_device": "",              # 麦克风设备名（空=系统默认）
-    # Whisper 模型
-    "companion_whisper_model_size": "small",   # 对话整合转写用的模型档位 tiny/base/small/medium/large-v3（small 中文准确率明显高于 base，默认用 small）
+    # 语音识别模型（Qwen3-ASR；配置键沿用 whisper_* 以兼容旧存档）
+    "companion_whisper_model_size": "0.6B",    # 对话整合转写用的模型档位 0.6B/1.7B（Qwen3-ASR，0.6B CPU 可跑、中文准，默认）
     "companion_whisper_model_path": "",         # 用户手填模型目录（优先）
-    "companion_whisper_download_dir": "",       # 下载落点（空=用 <companion>/whisper-models）
-    "companion_whisper_kws_model_size": "tiny", # 唤醒词/结束词识别用的模型档位（默认 tiny 最快）
-    "companion_whisper_kws_model_path": "",     # 唤醒词识别模型目录（空=自动找对应 size）
+    "companion_whisper_download_dir": "",       # 下载落点（空=用 <companion>/qwen-models）
+    "companion_whisper_kws_model_size": "0.6B", # 唤醒词/结束词识别用的模型档位（保留兼容）
+    "companion_whisper_kws_model_path": "",     # 唤醒词识别模型目录（保留兼容）
     "companion_whisper_device": "cpu",          # cpu | cuda
-    "companion_whisper_compute": "int8",        # int8 | int8_float16 | float16 | float32
-    "companion_whisper_beam": 2,               # 对话转写 beam（1=快，2=略慢但更准）
+    "companion_whisper_compute": "int8",        # 保留兼容（Qwen 用 float32/float16）
+    "companion_whisper_beam": 2,               # 保留兼容（Qwen 不用 beam）
 }
 
 
@@ -173,14 +173,18 @@ class CompanionStore:
         return self.root / "presets.json"
 
     def whisper_models_dir(self) -> Path:
-        """Whisper 模型下载落点；配置里指定了就跟随，否则用 <companion>/whisper-models。"""
+        """语音识别模型下载落点（Qwen3-ASR）；配置里指定了就跟随，否则用 <companion>/qwen-models。"""
         custom = str(self.get("companion_whisper_download_dir", "") or "").strip()
         if custom:
             path = Path(custom).expanduser()
         else:
-            path = self.root / "whisper-models"
+            path = self.root / "qwen-models"
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def qwen_models_dir(self) -> Path:
+        """Qwen3-ASR 模型下载落点（whisper_models_dir 的语义别名）。"""
+        return self.whisper_models_dir()
 
     def library_dir(self, category: str) -> Path:
         key = f"companion_lib_{category}"

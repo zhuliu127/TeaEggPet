@@ -887,14 +887,11 @@ class VoiceAssistant(QObject):
 
             from . import asr
 
-            beam = max(1, int(self._cfg("companion_whisper_beam", 2) or 2))
-            # vad_filter=False：录音已经很短，交给 Whisper 直接识别（不再叠内部 VAD 以免吞句）。
-            # 不传 initial_prompt（避免被复述成回声）。
-            text = asr.transcribe(self._engine, audio, language="zh",
-                                  vad_filter=False, beam_size=beam,
-                                  initial_prompt=None)
-            # v1.4.35：音频处理全部去掉（只剩重采样的抗混叠降噪）。这里只对「文字」做繁→简转换，
-            # 不动音频——中文 whisper 模型原生常输出繁体，转简体纯属显示层，用户已确认保留。
+            # Qwen3-ASR：直接整句转写（v1.4.37 从 whisper 迁移而来）。
+            # beam_size/vad_filter/initial_prompt 等 whisper 专有参数在 asr.transcribe
+            # 里被忽略（保留只为兼容旧调用），中文统一按 "Chinese" 识别。
+            text = asr.transcribe(self._engine, audio, language="zh")
+            # 轻量繁→简转换（Qwen 中文偶尔输出繁体，纯显示层，不动音频）。
             text = _to_simplified(text or "")
             self.heard.emit(text or "")
             text = (text or "").strip()
@@ -905,7 +902,7 @@ class VoiceAssistant(QObject):
             # （典型如「字幕by索兰娅」「谢谢观看请订阅」「以下是普通话的句子」）。
             # 只拦这些明确的套话/幻听，正常话语一律放行，绝不误杀。
             if (not text or _looks_like_subtitle_junk(text)
-                    or _is_prompt_echo(text) or _looks_like_hallucinated(text)):
+                    or _is_prompt_echo(text) or _looks_hallucinated(text)):
                 self._set_state("idle")
                 if not text:
                     self._demote_device(used_dev)
@@ -962,7 +959,7 @@ class VoiceAssistant(QObject):
         model_dir = asr.resolve_model_dir(self._cfg)
         if not model_dir:
             self.error.emit(
-                "还没有可用的 Whisper 模型：请到「陪伴扩展设置 → 语音助手」里"
+                "还没有可用的语音识别模型（Qwen3-ASR）：请到「陪伴扩展设置 → 语音助手」里"
                 "选一个模型点「下载」，或填入已有模型目录。")
             return False
         try:
@@ -976,11 +973,11 @@ class VoiceAssistant(QObject):
                 eff_cuda = False
             eff_note = "cuda" if eff_cuda else ("cpu（CUDA 不可用已自动回退，不影响使用）"
                                                if device != "cpu" else "cpu")
-            log.info("语音识别模型已加载：%s（请求 device=%s,%s 实际=%s）",
-                     model_dir, device, compute, eff_note)
+            log.info("语音识别模型已加载：%s（Qwen3-ASR，请求 device=%s 实际=%s）",
+                     model_dir, device, eff_note)
             return True
         except Exception as exc:  # noqa: BLE001
-            log.exception("加载 Whisper 模型失败")
+            log.exception("加载语音识别模型失败")
             self.error.emit(f"加载模型失败：{exc}")
             return False
 

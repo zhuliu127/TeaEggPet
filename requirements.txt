@@ -99,3 +99,16 @@ opencv-python-headless>=4.5.1.48
 # 能按 requirements 复现静态检查（FINAL_REVIEW_GPT.md 提交卫生项，批10 补）。
 pytest>=8
 ruff>=0.5
+
+# ── 语音助手：本地 Qwen3-ASR 语音转文字（pet/companion/asr.py）──
+# 之前用 faster-whisper，v1.4.37 起改用 Qwen3-ASR（中文更准、CPU 可跑）。
+# 模型权重不进 pip，运行时由 modelscope 从国内镜像下载到 companion/qwen-models。
+# torch 用 CPU 版（体积/兼容性考虑，PyInstaller 打包亦按 CPU 收集）。
+torch>=2.0
+transformers==4.57.6
+qwen-asr>=0.0.6
+modelscope>=1.20
+accelerate>=1.0
+# qwen-asr 的 transformers 后端经由 nagisa 做分词；nagisa 的扁平子模块
+# (prepro/model/mecab_system_eval) 需配合 pyi_rth_nagisa.py 运行时钩子。
+nagisa>=0.2.11
