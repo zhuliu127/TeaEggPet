@@ -900,12 +900,19 @@ class VoiceAssistant(QObject):
             text = (text or "").strip()
             log.info("识别结果：%r", text)
             used_dev = self._rec_dev_index
-            # v1.4.35：不再做任何「字幕套话/回声/幻听」文本过滤——用户明确要求只需降噪，
-            # 识别到什么就发什么，避免误杀正常话语。只处理「完全空」这一种情况。
-            if not text:
+            # v1.4.36：音频处理仍全部去掉（只剩降噪），但「防幻听」的文字过滤必须保留——
+            # 这不是音频处理，而是拦掉 whisper 在静音/噪声段凭空编造的无意义文字
+            # （典型如「字幕by索兰娅」「谢谢观看请订阅」「以下是普通话的句子」）。
+            # 只拦这些明确的套话/幻听，正常话语一律放行，绝不误杀。
+            if (not text or _looks_like_subtitle_junk(text)
+                    or _is_prompt_echo(text) or _looks_like_hallucinated(text)):
                 self._set_state("idle")
-                self._demote_device(used_dev)
-                self.status.emit("（没听清）再按住「%s」说一遍～" % self.hotkey_combo())
+                if not text:
+                    self._demote_device(used_dev)
+                    self.status.emit("（没听清）再按住「%s」说一遍～" % self.hotkey_combo())
+                else:
+                    log.info("丢弃疑似幻听/字幕套话：%r", text)
+                    self.status.emit("（这段没听清）再按住说一遍试试～")
                 return
             # 识别成功 → 记住这个端点，下次优先用它
             if used_dev is not None:
@@ -921,7 +928,11 @@ class VoiceAssistant(QObject):
 
     def _dispatch(self, text: str) -> None:
         """在 GUI 线程里按内容派发：指令 / 普通对话。"""
-        # v1.4.35：不再做回声/幻听文本过滤，识别到什么就派发什么。
+        # v1.4.36：兜底拦一道幻听/字幕套话（与识别后的过滤双保险，防止漏网进对话）。
+        if _looks_like_subtitle_junk(text) or _is_prompt_echo(text):
+            log.info("丢弃疑似幻听/字幕套话：%r", text)
+            self._set_state("idle")
+            return
         if not (text or "").strip():
             self._set_state("idle")
             return
