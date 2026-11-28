@@ -29,7 +29,7 @@ import threading
 import time
 from typing import Any, Optional
 
-from PySide6.QtCore import QObject, Signal, QTimer
+from PySide6.QtCore import QObject, Qt, Signal, QTimer
 
 from .ptt_hotkey import PushToTalkHotkey, is_supported as _ptt_supported
 
@@ -286,6 +286,9 @@ class VoiceAssistant(QObject):
     error = Signal(str)
     # 跨线程发声请求：后台线程 emit，GUI 线程槽执行（QMediaPlayer 只能主线程用）。
     speak_requested = Signal(str)
+    # 跨线程派发请求：识别在后台线程完成，必须经信号投递回 GUI 线程执行
+    #（后台线程里 QTimer.singleShot 没有事件循环不会触发——这是「识别成功却没进对话」的根因）。
+    dispatch_requested = Signal(str)
 
     def __init__(self, app, parent=None) -> None:
         super().__init__(parent)
@@ -309,6 +312,14 @@ class VoiceAssistant(QObject):
             self.speak_requested.connect(self._do_speak)
         except Exception:  # noqa: BLE001
             pass
+        try:
+            # QueuedConnection：后台识别线程 emit，GUI 线程跑 _dispatch（含开聊天窗/发消息）。
+            self.dispatch_requested.connect(self._dispatch, Qt.QueuedConnection)
+        except Exception:  # noqa: BLE001
+            try:
+                self.dispatch_requested.connect(self._dispatch)
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------ 配置
     def _store(self):
@@ -396,7 +407,7 @@ class VoiceAssistant(QObject):
     # ------------------------------------------------------------ 钩子回调（后台线程）
     def _on_pressed(self) -> None:
         """按住语音键开始录音（钩子线程回调 → 起录音线程）。"""
-        if self._state == "recording":
+        if self._state == "recording" or self._rec_thread is not None:
             return
         if not self._enabled():
             return
@@ -680,7 +691,9 @@ class VoiceAssistant(QObject):
             if used_dev is not None:
                 self._last_good_device = used_dev
             self._last_user_text = text
-            QTimer.singleShot(0, lambda: self._dispatch(text))
+            # 从后台识别线程投递回 GUI 线程派发（不能用 QTimer.singleShot，
+            # 后台线程没有 Qt 事件循环，单发定时器永远不触发 → 识别成功却没进对话）。
+            self.dispatch_requested.emit(text)
         except Exception as exc:  # noqa: BLE001
             log.exception("识别失败")
             self.error.emit(f"识别失败：{exc}")

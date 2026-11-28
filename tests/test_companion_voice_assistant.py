@@ -389,3 +389,23 @@ def test_demote_device_moves_to_next_candidate():
             sys.modules["sounddevice"] = orig
         else:
             sys.modules.pop("sounddevice", None)
+
+
+def test_dispatch_requested_signal_from_background_thread():
+    # v1.4.27：识别在后台线程完成，必须经 dispatch_requested 信号（QueuedConnection）
+    # 投递回 GUI 线程派发；后台线程直接 QTimer.singleShot 不会触发（没事件循环）。
+    import threading, time
+    a = _make()
+    got = {}
+    def fake_dispatch(text):
+        got['t'] = text
+    a._dispatch = fake_dispatch  # type: ignore[assignment]
+    a.dispatch_requested.connect(fake_dispatch, va.Qt.QueuedConnection)
+    def bg():
+        a.dispatch_requested.emit('今天天气真不错')
+    th = threading.Thread(target=bg); th.start(); th.join()
+    app = _app()
+    end = time.time() + 2.0
+    while time.time() < end and 't' not in got:
+        app.processEvents(); time.sleep(0.02)
+    assert got.get('t') == '今天天气真不错'
