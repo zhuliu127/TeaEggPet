@@ -412,6 +412,13 @@ class VoiceAssistant(QObject):
             return
         self._set_state("recording")
         self.status.emit("正在听你说…（松开语音键结束）")
+        # 在桌宠上方冒一个「正在听你说话」提示，让用户知道麦克风已在监听
+        try:
+            from . import runtime as rt
+
+            rt.bubble("🎤 正在听你说话…", 60000)
+        except Exception:  # noqa: BLE001
+            log.debug("监听提示气泡失败", exc_info=True)
         self._rec_chunks = []
         self._rec_stop.clear()
         self._rec_thread = threading.Thread(
@@ -459,6 +466,7 @@ class VoiceAssistant(QObject):
         if self._state != "recording":
             return
         self._rec_stop.set()
+        self._hide_listen_bubble()
         self._set_state("processing")
         self.status.emit("正在识别…")
         th = self._rec_thread
@@ -473,13 +481,25 @@ class VoiceAssistant(QObject):
         threading.Thread(target=self._transcribe_and_dispatch, args=(chunks,),
                          name="VoiceTranscribe", daemon=True).start()
 
-    def _device_candidates(self) -> list:
-        """按配置的麦克风名返回【全部可用输入端点】，按优先级排序。
+    def _hide_listen_bubble(self) -> None:
+        """松开语音键时把「正在听你说话」提示收起来。"""
+        try:
+            from . import runtime as rt
 
-        排序依据（实测本机 BOYA）：WASAPI / DirectSound 这两路能收到真实人声，
-        而 MME / WDM-KS 常常是「能开但永远静音」的死端点。所以把 WASAPI、
-        DirectSound 排在前面，MME / WDM-KS 垫底；同名内声道多的优先。
-        返回元素为 sounddevice 的设备索引（int）。名字为空或没匹配到 → [None]（系统默认）。
+            host = rt.bubble_host() if hasattr(rt, "bubble_host") else None
+            hide = getattr(host, "hide_bubble", None)
+            if callable(hide):
+                hide()
+        except Exception:  # noqa: BLE001
+            log.debug("收起监听提示失败", exc_info=True)
+
+    def _raw_name_candidates(self) -> list:
+        """按配置的麦克风名返回【同名输入端点】若干候选，按托管层优先级排序。
+
+        注意：这里只是「原始排序」，不代表一定能录到声音——DirectSound 在本机
+        会「能开但 InputStream 永远返回全零」，WDM-KS「Blocking API not supported」。
+        真正可用的端点由 :meth:`_pick_device` 用 InputStream 实测电平筛出来。
+        排序只用于「相同情况下先试哪个」：WASAPI(3) > MME(2) > DirectSound(1) > 其它(0)。
         """
         name = str(self._cfg("companion_voice_device", "") or "").strip()
         try:
@@ -500,42 +520,91 @@ class VoiceAssistant(QObject):
                     api = str(hostapis[dev.get("hostapi", -1)].get("name", "")).upper()
                 except Exception:  # noqa: BLE001
                     api = ""
-                # 等级：WASAPI=3, DirectSound=3, 其它(MME/WDM-KS)=0
                 if "WASAPI" in api:
                     tier = 3
+                elif "MME" in api:
+                    tier = 2
                 elif "DIRECTSOUND" in api:
-                    tier = 3
-                else:
+                    tier = 1
+                else:  # WDM-KS 等
                     tier = 0
                 hits.append((tier, ch, idx))
             if not hits:
                 return [None]
             hits.sort(key=lambda t: (t[0], t[1]), reverse=True)
-            # 把上次实测音量最好的设备提到最前（_last_good_device）
-            cands = [t[2] for t in hits]
-            lg = getattr(self, "_last_good_device", None)
-            if lg is not None and lg in cands:
-                cands.remove(lg)
-                cands.insert(0, lg)
-            return cands
+            return [t[2] for t in hits]
         except Exception:  # noqa: BLE001
             return [None]
 
+    def _probe_input_stream(self, dev, seconds: float = 0.5):
+        """用【程序实际录音用的 InputStream 路径】试录一小段，返回 (ok, rms, sr)。
+
+        直接复用阻塞 read 的真实音频通路：WDM-KS 打不开、DirectSound 返回全零、
+        设备被占用等都会被这里如实暴露，从而只在「真能拿到声音」的端点上录音。
+        """
+        import numpy as np
+        import sounddevice as sd
+
+        info = sd.query_devices(dev) if dev is not None else sd.query_devices(kind="input")
+        sr = int(info.get("default_samplerate") or SAMPLE_RATE)
+        block = max(1, int(sr * BLOCK_MS / 1000))
+        stream = sd.InputStream(samplerate=sr, channels=1, dtype="float32",
+                                blocksize=block, device=dev)
+        try:
+            stream.start()
+            n = max(1, int(seconds * sr / block))
+            vals = []
+            for _ in range(n):
+                data, _of = stream.read(block)
+                raw = data[:, 0] if data.ndim > 1 else data
+                vals.append(np.asarray(raw, dtype=np.float32).copy())
+            audio = np.concatenate(vals) if vals else np.zeros(0, dtype=np.float32)
+            rms = float(np.sqrt(np.mean(audio ** 2))) if audio.size else 0.0
+            peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+            return True, rms, peak, sr
+        finally:
+            try:
+                stream.stop(); stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     def _pick_device(self) -> int | None:
-        """挑首选输入设备（候选第一个）。"""
-        cands = self._device_candidates()
-        return cands[0] if cands else None
+        """挑一个【真能录到声音】的端点：按候选顺序用 InputStream 实测，取第一个能开的。
+
+        - 之前「WASAPI 优先」的静态排序会踩到 DirectSound（InputStream 返回全零）
+          或 WDM-KS（打不开）——这里改成真的开流试一下，开不了/全零就换下一个。
+        - 选中后缓存到 self._usable_device，避免每次按键都重新探测。
+        """
+        cached = getattr(self, "_usable_device", None)
+        cands = self._raw_name_candidates()
+        order = []
+        if cached is not None:
+            order.append(cached)
+        for c in cands:
+            if c not in order:
+                order.append(c)
+        for dev in order:
+            try:
+                ok, rms, peak, sr = self._probe_input_stream(dev, seconds=0.3)
+            except Exception as exc:  # noqa: BLE001
+                log.info("麦克风端点 %s 打不开，跳过：%s", dev, exc)
+                continue
+            if not ok:
+                continue
+            # 允许「安静时电平为 0」——真正判断可用只看「能开且能读到数据」。
+            self._usable_device = dev
+            return dev
+        log.warning("没有可用的麦克风输入端点（全部打不开或读不到数据）")
+        return None
 
     def _demote_device(self, bad_dev) -> None:
-        """把没听清的端点降级：下次首选换成候选里的下一个（避开死端点/低灵敏端点）。"""
+        """把没听清的端点标记为可疑：下次首选换个端点（仅在还有别的候选时）。"""
         try:
-            cands = self._device_candidates()
-            if not cands:
-                return
-            if bad_dev in cands and len(cands) > 1:
+            cands = self._raw_name_candidates()
+            if len(cands) > 1 and bad_dev in cands:
                 idx = cands.index(bad_dev)
                 nxt = cands[(idx + 1) % len(cands)]
-                self._last_good_device = nxt
+                self._usable_device = nxt
                 log.info("麦克风端点 %s 未识别成功，下次改用端点 %s", bad_dev, nxt)
         except Exception:  # noqa: BLE001
             pass

@@ -294,8 +294,8 @@ def test_subtitle_junk_filters_new_phrases():
     assert va._looks_like_subtitle_junk("今天天气真不错我们出去玩") is False
 
 
-def test_device_candidates_orders_wasapi_directsound_first():
-    # _device_candidates 应把 WASAPI / DirectSound 排在 MME / WDM-KS 之前
+def test_raw_name_candidates_orders_wasapi_before_directsound():
+    # _raw_name_candidates 原始排序：WASAPI(3) > MME(2) > DirectSound(1) > WDM-KS(0)
     import sys
     fake_sd = types.SimpleNamespace(
         query_hostapis=lambda: [{"name": "Windows MME"},
@@ -313,35 +313,77 @@ def test_device_candidates_orders_wasapi_directsound_first():
     sys.modules["sounddevice"] = fake_sd
     try:
         a = _make({"companion_voice_device": "BOYA"})
-        a._last_good_device = None
-        cands = a._device_candidates()
+        cands = a._raw_name_candidates()
     finally:
         if orig is not None:
             sys.modules["sounddevice"] = orig
         else:
             sys.modules.pop("sounddevice", None)
-    # WASAPI(2)、DirectSound(1) 应排在 MME(0)、WDM-KS(3) 前
-    assert cands.index(2) < cands.index(0)
-    assert cands.index(1) < cands.index(0)
+    # WASAPI(2) 应排第一；WDM-KS(3) 排最后
+    assert cands[0] == 2
+    assert cands[-1] == 3
+
+
+def test_pick_device_skips_unopenable_and_zeros():
+    # _pick_device 用 InputStream 实测：跳过打不开的(WDM-KS)和返回全零的(DirectSound)，
+    # 选第一个「能开且读到数据」的端点（这里是 MME）。
+    import sys
+    fake_sd = types.SimpleNamespace(
+        query_hostapis=lambda: [{"name": "Windows MME"},
+                                {"name": "Windows DirectSound"},
+                                {"name": "Windows WASAPI"},
+                                {"name": "Windows WDM-KS"}],
+        query_devices=lambda dev=None, kind=None: (
+            {"name": "麦克风 (BOYA)", "max_input_channels": 1, "default_samplerate": 44100}
+            if dev is not None else
+            [
+                {"name": "麦克风 (BOYA)", "max_input_channels": 1, "hostapi": 0},
+                {"name": "麦克风 (BOYA)", "max_input_channels": 1, "hostapi": 1},
+                {"name": "麦克风 (BOYA)", "max_input_channels": 2, "hostapi": 2},
+                {"name": "麦克风 (BOYA)", "max_input_channels": 1, "hostapi": 3},
+            ]
+        ),
+    )
+    orig = sys.modules.get("sounddevice")
+    sys.modules["sounddevice"] = fake_sd
+    try:
+        a = _make({"companion_voice_device": "BOYA"})
+        a._usable_device = None
+
+        def fake_probe(dev, seconds=0.3):
+            if dev == 3:      # WDM-KS 打不开
+                raise OSError("Blocking API not supported")
+            if dev == 1:      # DirectSound 返回全零
+                return (True, 0.0, 0.0, 44100)
+            return (True, 0.05, 0.4, 44100)  # WASAPI(2)/MME(0) 正常
+        a._probe_input_stream = fake_probe  # type: ignore[assignment]
+        # 候选顺序 WASAPI(2)→MME(0)→DS(1)→WDM-KS(3)，2 可用 → 直接选 2
+        assert a._pick_device() == 2
+        assert a._usable_device == 2
+    finally:
+        if orig is not None:
+            sys.modules["sounddevice"] = orig
+        else:
+            sys.modules.pop("sounddevice", None)
 
 
 def test_demote_device_moves_to_next_candidate():
     import sys
     fake_sd = types.SimpleNamespace(
-        query_hostapis=lambda: [{"name": "Windows MME"}, {"name": "Windows WASAPI"}],
+        query_hostapis=lambda: [{"name": "Windows WASAPI"}, {"name": "Windows MME"}],
         query_devices=lambda: [
-            {"name": "BOYA", "max_input_channels": 1, "hostapi": 0},  # MME 0
-            {"name": "BOYA", "max_input_channels": 2, "hostapi": 1},  # WASAPI 1
+            {"name": "BOYA", "max_input_channels": 2, "hostapi": 0},  # WASAPI 0
+            {"name": "BOYA", "max_input_channels": 1, "hostapi": 1},  # MME 1
         ],
     )
     orig = sys.modules.get("sounddevice")
     sys.modules["sounddevice"] = fake_sd
     try:
         a = _make({"companion_voice_device": "BOYA"})
-        a._last_good_device = None
-        # 首选是 WASAPI(1)，把它降级后应改用下一个候选 MME(0)
-        a._demote_device(1)
-        assert a._last_good_device == 0
+        a._usable_device = 0
+        # 首选是 WASAPI(0)，把它降级后应改用下一个候选 MME(1)
+        a._demote_device(0)
+        assert a._usable_device == 1
     finally:
         if orig is not None:
             sys.modules["sounddevice"] = orig
