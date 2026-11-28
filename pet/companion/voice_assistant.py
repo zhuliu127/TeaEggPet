@@ -643,13 +643,17 @@ class VoiceAssistant(QObject):
                 return
             dvinfo = sd.query_devices(dev) if dev is not None else sd.query_devices(kind="input")
             sr = int(dvinfo.get("default_samplerate") or SAMPLE_RATE)
+            # v1.4.39：按设备实际声道数打开再下混为单声道。有些 USB 麦克风（如 BOYA G30）
+            # 在 WASAPI 下报 2 声道，强行 channels=1 可能取到无声/错声道；开 2 声道再取均值最稳。
+            max_ch = int(dvinfo.get("max_input_channels") or 1)
+            dev_ch = 1 if max_ch <= 1 else 2
             block = max(1, int(sr * BLOCK_MS / 1000))
-            stream = sd.InputStream(samplerate=sr, channels=1, dtype="float32",
+            stream = sd.InputStream(samplerate=sr, channels=dev_ch, dtype="float32",
                                     blocksize=block, device=dev)
             stream.start()
             self._rec_stream = stream
             self._rec_dev_index = dev
-            log.info("开始录音：device=%s samplerate=%d", dev, sr)
+            log.info("开始录音：device=%s samplerate=%d channels=%d", dev, sr, dev_ch)
             max_blocks = int(MAX_RECORD_SEC * sr / block)
             n = 0
             # v1.4.34：每次只读一小片（≤20ms），松开后最多 20ms 就退出循环，
@@ -658,7 +662,10 @@ class VoiceAssistant(QObject):
             all_zero_blocks = 0
             while not self._rec_stop.is_set() and n < max_blocks:
                 data, _of = stream.read(sub)
-                raw = data[:, 0].copy() if data.ndim > 1 else data.copy()
+                if data.ndim > 1 and data.shape[1] > 1:
+                    raw = data.mean(axis=1).astype(np.float32)  # 多声道下混为单声道
+                else:
+                    raw = (data[:, 0] if data.ndim > 1 else data).copy()
                 self._rec_chunks.append((raw.astype(np.float32), sr))
                 n += 1
                 # v1.4.34：连续录到全零（说明这个端点其实是死的，如 DirectSound 返回全零），
@@ -781,8 +788,10 @@ class VoiceAssistant(QObject):
 
         info = sd.query_devices(dev) if dev is not None else sd.query_devices(kind="input")
         sr = int(info.get("default_samplerate") or SAMPLE_RATE)
+        max_ch = int(info.get("max_input_channels") or 1)
+        dev_ch = 1 if max_ch <= 1 else 2
         block = max(1, int(sr * BLOCK_MS / 1000))
-        stream = sd.InputStream(samplerate=sr, channels=1, dtype="float32",
+        stream = sd.InputStream(samplerate=sr, channels=dev_ch, dtype="float32",
                                 blocksize=block, device=dev)
         try:
             stream.start()
@@ -790,7 +799,10 @@ class VoiceAssistant(QObject):
             vals = []
             for _ in range(n):
                 data, _of = stream.read(block)
-                raw = data[:, 0] if data.ndim > 1 else data
+                if data.ndim > 1 and data.shape[1] > 1:
+                    raw = data.mean(axis=1).astype(np.float32)
+                else:
+                    raw = (data[:, 0] if data.ndim > 1 else data)
                 vals.append(np.asarray(raw, dtype=np.float32).copy())
             audio = np.concatenate(vals) if vals else np.zeros(0, dtype=np.float32)
             rms = float(np.sqrt(np.mean(audio ** 2))) if audio.size else 0.0
@@ -844,32 +856,33 @@ class VoiceAssistant(QObject):
             pass
 
     def _transcribe_and_dispatch(self, chunks) -> None:
-        """后台线程：把录音拼起来 → 重采样到 16k → Whisper 识别 → 派发。"""
+        """后台线程：把录音原样拼接（不做任何重采样/滤波）→ 原生采样率直传 Qwen3-ASR → 派发。
+
+        v1.4.39：用户要求「把处理语音的功能都去掉，直接用原生语音识别转文字」。
+        Qwen3-ASR 的 transcribe 接受 (audio, sample_rate) 任意采样率，故直接按设备原生
+        采样率(如 48000Hz)喂给它，**不再重采样、不走 FIR 低通、不做任何增益/归一化**。
+        录音是设备原生 float32 单声道，原样转交即可。
+        """
         import numpy as np
 
         try:
-            # 按各自采样率把块重采样到 16k 后拼接
-            pieces = []
-            for raw, sr in chunks:
-                if sr == SAMPLE_RATE:
-                    pieces.append(raw)
-                else:
-                    rs = _resample_to_16k(raw, sr)
-                    if rs.shape[0] > 0:
-                        pieces.append(rs)
-            if not pieces:
+            if not chunks:
                 self._set_state("idle")
                 return
-            audio = np.concatenate(pieces)
+            # 同一录音流里采样率一致，取第一块的即可；原样拼接，不做重采样/滤波。
+            sr = int(chunks[0][1]) or SAMPLE_RATE
+            raws = [raw for raw, _sr in chunks]
+            audio = np.concatenate(raws) if len(raws) > 1 else raws[0]
+            audio = np.asarray(audio, dtype=np.float32).reshape(-1)
             # 太短（<0.2s）基本是误触
-            if audio.shape[0] < int(0.2 * SAMPLE_RATE):
+            if audio.shape[0] < int(0.2 * sr):
                 self._set_state("idle")
                 self.status.emit("（太短了）按住「%s」说完再松开～" % self.hotkey_combo())
                 return
             rms = float(np.sqrt(np.mean(audio ** 2)) + 1e-9)
-            log.info("录音结束：时长 %.2fs rms=%.4f", audio.shape[0] / SAMPLE_RATE, rms)
+            log.info("录音结束：时长 %.2fs sr=%d rms=%.4f", audio.shape[0] / sr, sr, rms)
 
-            # 电平太低基本是没说话/麦克风静音——直接提示，别硬塞给 Whisper 产生幻听。
+            # 电平太低基本是没说话/麦克风静音——直接提示，别硬塞给 ASR 产生幻听。
             if rms < 0.003:
                 self._set_state("idle")
                 self.status.emit(
@@ -877,20 +890,14 @@ class VoiceAssistant(QObject):
                     "按住「%s」时再大声点说～" % self.hotkey_combo())
                 return
 
-            # v1.4.35：用户要求「去掉所有额外音频处理，只保留降噪」。
-            # 这里不再做高通滤波、不再做峰值归一化（放大容易削波/放噪）。唯一的降噪就是
-            # 重采样里的抗混叠低通（_resample_to_16k 内部 FIR 低通），属于采样率转换的必需步骤。
-
             if self._engine is None and not self._load_models():
                 self._set_state("idle")
                 return
 
             from . import asr
 
-            # Qwen3-ASR：直接整句转写（v1.4.37 从 whisper 迁移而来）。
-            # beam_size/vad_filter/initial_prompt 等 whisper 专有参数在 asr.transcribe
-            # 里被忽略（保留只为兼容旧调用），中文统一按 "Chinese" 识别。
-            text = asr.transcribe(self._engine, audio, language="zh")
+            # v1.4.39：直传原生采样率，不重采样、不滤波、不归一化——「原生语音识别」。
+            text = asr.transcribe(self._engine, audio, language="zh", sample_rate=sr)
             # 轻量繁→简转换（Qwen 中文偶尔输出繁体，纯显示层，不动音频）。
             text = _to_simplified(text or "")
             self.heard.emit(text or "")
