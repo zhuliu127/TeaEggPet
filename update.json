@@ -1,6 +1,6 @@
 {
-  "version": "1.4.28",
-  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases/tag/v1.4.28",
-  "notes": "v1.4.28 修复：\n1. 修复「对话窗口打不开」——overlay 宿主下打开聊天窗失败（AppShell 没有 open_modern_chat），改为兼容 AppShell，改用 open_full_chat 并取 _instance 上的聊天窗，识别出的文字现在能正常进 AI 对话。\n2. 修复「之后再按 Win+Alt 没反应」——录音线程结束后未清空句柄，导致后续按键被防重复守卫挡掉。\n3. 保持：按住说话提示、麦克风端点实测选择（跳过 DirectSound 全零/WDM-KS 打不开）、后台预加载模型、响度归一化。",
+  "version": "1.4.30",
+  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases/tag/v1.4.30",
+  "notes": "v1.4.30 更新：\n\n1. 语音注入不再弹出前台聊天窗——按住 Win+Alt 说完话，识别出的文字会自动注入 AI 对话并生成回复语音，但聊天窗不会强行弹到最前面（不抢焦点、不打断你正在做的事）。\n2. 按住到开始聆听更快：启动时后台预先探测并缓存可用麦克风，按住即可录音，不再有首按的试录延迟。\n3. 修复连按几次 Win+Alt 后「🎤 正在听你说话…」提示不消失：松手时一定会收起提示（含快速连按）。\n4. 修复「对话窗口打不开」与「松开后再按 Win+Alt 没反应」。",
   "assets": {}
 }

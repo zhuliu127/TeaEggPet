@@ -371,7 +371,28 @@ class VoiceAssistant(QObject):
         self.status.emit("语音助手已就绪：按住「%s」说话，松开我就识别并回复～" % self.hotkey_combo())
         # 后台预加载识别模型：否则第一次按住说话时模型还在加载，音频会被丢光。
         self._warmup_model()
+        # 后台预探测麦克风端点：把「按住→能录音」的延迟从首次按键时的多次试录里省掉。
+        self._warmup_device()
         return True
+
+    def _warmup_device(self) -> None:
+        """后台线程预解析可用麦克风端点并缓存到 self._usable_device。
+
+        首次按键若现场逐个试录多个端点（每个 0.3s），会明显拖慢「按住→开始录音」。
+        在启动时先探一次，之后按键直接用缓存端点开流，按住即可录音。
+        """
+        if getattr(self, "_usable_device", None) is not None:
+            return
+
+        def _go():
+            try:
+                dev = self._pick_device()
+                if dev is not None:
+                    log.info("麦克风端点预探测完成：device=%s", dev)
+            except Exception:  # noqa: BLE001
+                log.debug("麦克风端点预探测失败", exc_info=True)
+
+        threading.Thread(target=_go, name="VoiceWarmupDevice", daemon=True).start()
 
     def stop(self) -> None:
         """摘掉钩子、停止录音、关流（幂等，不阻塞）。"""
@@ -415,7 +436,16 @@ class VoiceAssistant(QObject):
         QTimer.singleShot(0, self._begin_recording)
 
     def _on_released(self) -> None:
-        QTimer.singleShot(0, self._end_recording)
+        # 无论当前状态如何，松手一律收起「正在听你说话」提示——避免连按几次时
+        # 因状态已切到 processing 导致某次松手被早退、提示一直挂在屏幕上。
+        QTimer.singleShot(0, self._on_released_gui)
+
+    def _on_released_gui(self) -> None:
+        try:
+            self._hide_listen_bubble()
+        except Exception:  # noqa: BLE001
+            log.debug("收起监听提示失败", exc_info=True)
+        self._end_recording()
 
     # ------------------------------------------------------------ 录音
     def _begin_recording(self) -> None:
@@ -423,11 +453,13 @@ class VoiceAssistant(QObject):
             return
         self._set_state("recording")
         self.status.emit("正在听你说…（松开语音键结束）")
-        # 在桌宠上方冒一个「正在听你说话」提示，让用户知道麦克风已在监听
+        # 在桌宠上方冒一个「正在听你说话」提示，让用户知道麦克风已在监听。
+        # 松手时 _hide_listen_bubble 会主动收起；这里仍给一个有限时长兜底，
+        # 万一收起调用被异常路径跳过，也会在 30 秒内自动消失，不会永久滞留。
         try:
             from . import runtime as rt
 
-            rt.bubble("🎤 正在听你说话…", 60000)
+            rt.bubble("🎤 正在听你说话…", 30000)
         except Exception:  # noqa: BLE001
             log.debug("监听提示气泡失败", exc_info=True)
         self._rec_chunks = []
@@ -444,7 +476,10 @@ class VoiceAssistant(QObject):
         try:
             # 不在这里加载模型（start() 已后台预热）。若还没就绪，录音照常先进行，
             # 识别阶段再等模型——避免模型加载的十几秒把用户说的话整个吞掉。
-            dev = self._pick_device()
+            # 端点已缓存就直接开流（省掉首次按键的逐端点试录延迟）；未缓存才探测。
+            dev = getattr(self, "_usable_device", None)
+            if dev is None:
+                dev = self._pick_device()
             dvinfo = sd.query_devices(dev) if dev is not None else sd.query_devices(kind="input")
             sr = int(dvinfo.get("default_samplerate") or SAMPLE_RATE)
             block = max(1, int(sr * BLOCK_MS / 1000))
@@ -501,9 +536,17 @@ class VoiceAssistant(QObject):
             from . import runtime as rt
 
             host = rt.bubble_host() if hasattr(rt, "bubble_host") else None
-            hide = getattr(host, "hide_bubble", None)
-            if callable(hide):
-                hide()
+            if host is None:
+                return
+            # 宿主可能把气泡实现在 speech bubble 或 alert bubble 两处，
+            # 两种收起方法都尝试一遍，确保提示一定消失。
+            for name in ("hide_speech_bubble", "hide_bubble"):
+                fn = getattr(host, name, None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception:  # noqa: BLE001
+                        log.debug("%s 收起失败", name, exc_info=True)
         except Exception:  # noqa: BLE001
             log.debug("收起监听提示失败", exc_info=True)
 
@@ -599,7 +642,7 @@ class VoiceAssistant(QObject):
                 order.append(c)
         for dev in order:
             try:
-                ok, rms, peak, sr = self._probe_input_stream(dev, seconds=0.3)
+                ok, rms, peak, sr = self._probe_input_stream(dev, seconds=0.2)
             except Exception as exc:  # noqa: BLE001
                 log.info("麦克风端点 %s 打不开，跳过：%s", dev, exc)
                 continue
@@ -848,19 +891,28 @@ class VoiceAssistant(QObject):
 
         QTimer.singleShot(0, _go)
 
-    def _ensure_chat(self, app):
+    def _ensure_chat(self, app, silent: bool = True):
         """拿到/打开 AI 对话窗。
 
-        兼容两种宿主：
-        - App（有 open_modern_chat / modern_chat_window）；
-        - AppShell（overlay 拓扑下 runtime.app() 返回的其实是 AppShell，它只有
-          open_full_chat()，真正的 App 实例在 app._instance 上，聊天窗也在那上面）。
+        兼容三种宿主形态（runtime.app() 实际返回什么就按什么处理）：
+        - App：有 open_modern_chat / modern_chat_window 直接可用；
+        - AppShell（overlay 拓扑下 runtime.app() 返回的进程级壳）：它没有
+          open_modern_chat，聊天窗挂在它主窗实例 app.instance 上（PetInstance，
+          有 open_chat / modern_chat_window / chat_window），也可能要退到
+          app._hotkey_overlay() 的 open_quick_chat；
+        - 兜底：任何带 open_chat 的对象。
+
+        ``silent=True``（语音注入默认）：只建窗/复用窗、驱动生成，**不 show/
+        raise/activate**，不在前台弹出聊天窗。生成由 ``_begin_generation`` 驱动，
+        与窗口可见性无关；回复语音照常朗读。
         """
         def _win_from(obj):
             if obj is None:
                 return None
-            w = getattr(obj, "modern_chat_window", None)
-            if w is not None:
+            for attr in ("modern_chat_window", "chat_window", "legacy_chat_window"):
+                w = getattr(obj, attr, None)
+                if w is None:
+                    continue
                 try:
                     import shiboken6
                     if shiboken6.isValid(w):
@@ -869,34 +921,72 @@ class VoiceAssistant(QObject):
                     return w
             return None
 
-        # 1) 已经有可用的现代聊天窗（App 或 shell 底层 App 上）
-        win = _win_from(app) or _win_from(getattr(app, "_instance", None))
-        if win is not None:
-            return win
+        # 收集所有可能的「持有聊天窗 / 能打开聊天窗」的候选对象
+        cands = [app, getattr(app, "instance", None),
+                 getattr(app, "_instance", None)]
 
-        # 2) 打开聊天窗：按宿主实际拥有的方法
-        opener = None
-        for name in ("open_full_chat", "open_modern_chat", "open_chat"):
-            fn = getattr(app, name, None)
-            if callable(fn):
-                opener = fn
-                break
-        inst = getattr(app, "_instance", None)
-        if opener is None and inst is not None:
-            for name in ("open_modern_chat", "open_chat"):
-                fn = getattr(inst, name, None)
-                if callable(fn):
-                    opener = fn
+        # 1) 已经有可用的聊天窗就直接返回
+        for obj in cands:
+            w = _win_from(obj)
+            if w is not None:
+                return w
+
+        # 2) 逐候选按其拥有的方法打开聊天窗
+        opened = False
+        for obj in cands:
+            if obj is None:
+                continue
+            # silent 优先：只有 open_modern_chat 支持 silent 参数（不弹前台窗）
+            modern = getattr(obj, "open_modern_chat", None)
+            if silent and callable(modern):
+                try:
+                    modern(silent=True)
+                    opened = True
+                except TypeError:
+                    # 旧签名不接受 silent，退回普通调用
+                    try:
+                        modern()
+                        opened = True
+                    except Exception:  # noqa: BLE001
+                        log.exception("打开聊天窗失败（%s.open_modern_chat）", type(obj).__name__)
+                except Exception:  # noqa: BLE001
+                    log.exception("打开聊天窗失败（%s.open_modern_chat silent）", type(obj).__name__)
+                if opened:
                     break
-        if opener is not None:
+                continue
+            for name in ("open_chat", "open_modern_chat", "open_full_chat"):
+                fn = getattr(obj, name, None)
+                if callable(fn):
+                    try:
+                        fn()
+                        opened = True
+                    except Exception:  # noqa: BLE001
+                        log.exception("打开聊天窗失败（%s.%s）", type(obj).__name__, name)
+                    break
+            if opened:
+                break
+
+        # 3) AppShell 的 overlay 回退：快速对话气泡
+        if not opened:
             try:
-                opener()
+                ov = app._hotkey_overlay() if hasattr(app, "_hotkey_overlay") else None
+                quick = getattr(ov, "open_quick_chat", None) if ov is not None else None
+                if callable(quick):
+                    quick()
+                    log.info("已用快速对话气泡作为聊天入口（overlay 回退）")
+                    opened = True
             except Exception:  # noqa: BLE001
-                log.exception("打开聊天窗失败")
-        else:
+                log.exception("overlay 快速对话打开失败")
+
+        if not opened:
             log.warning("当前宿主没有可用的打开聊天窗方法：%r", type(app).__name__)
 
-        return _win_from(app) or _win_from(getattr(app, "_instance", None))
+        # 4) 打开后再取窗口
+        for obj in cands:
+            w = _win_from(obj)
+            if w is not None:
+                return w
+        return None
 
     # ------------------------------------------------------------ 出声
     def _say(self, text: str) -> None:

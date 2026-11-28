@@ -464,3 +464,138 @@ def test_record_loop_resets_rec_thread_after_finish():
     a._rec_thread = None
     blocked2 = (a._state == "recording" or a._rec_thread is not None)
     assert blocked2 is False
+
+
+
+def test_ensure_chat_uses_app_instance_open_chat():
+    # AppShell: 聊天窗挂在 app.instance（PetInstance）上，open_chat 后取到 modern_chat_window。
+    a = _make()
+    class FakeWin:
+        def voice_submit(self, t): pass
+    win = FakeWin()
+    class FakeInst:
+        modern_chat_window = None
+        chat_window = None
+        legacy_chat_window = None
+        def open_chat(self):
+            self.modern_chat_window = win
+    class FakeShell:
+        instance = FakeInst()
+    got = a._ensure_chat(FakeShell())
+    assert got is win
+    assert callable(getattr(got, "voice_submit", None))
+
+
+def test_ensure_chat_returns_existing_window_no_open():
+    a = _make()
+    class FakeWin: pass
+    win = FakeWin()
+    class FakeInst:
+        modern_chat_window = win
+        def open_chat(self):
+            raise AssertionError("should not open when window exists")
+    class FakeShell:
+        instance = FakeInst()
+    assert a._ensure_chat(FakeShell()) is win
+
+
+def test_ensure_chat_returns_none_when_nothing_available():
+    a = _make()
+    class Empty:
+        pass
+    # 没有任何 open_* 方法、也没有窗口
+    assert a._ensure_chat(Empty()) is None
+
+
+def test_ensure_chat_opens_modern_chat_silent_by_default():
+    # 语音注入默认 silent=True：必须用 open_modern_chat(silent=True) 打开，
+    # 避免在前台弹出聊天窗。
+    a = _make()
+    calls = {}
+    class FakeWin:
+        def voice_submit(self, t): pass
+    win = FakeWin()
+    class FakeInst:
+        modern_chat_window = None
+        chat_window = None
+        legacy_chat_window = None
+        def open_modern_chat(self, silent=False):
+            calls["silent"] = silent
+            self.modern_chat_window = win
+        def open_chat(self):
+            raise AssertionError("silent 路径应优先 open_modern_chat，不应走 open_chat")
+    class FakeShell:
+        instance = FakeInst()
+    got = a._ensure_chat(FakeShell())
+    assert got is win
+    assert calls.get("silent") is True
+
+
+def test_ensure_chat_silent_off_uses_open_chat():
+    # silent=False 时维持旧行为（可走 open_chat 弹前台窗）。
+    a = _make()
+    class FakeWin:
+        def voice_submit(self, t): pass
+    win = FakeWin()
+    class FakeInst:
+        modern_chat_window = None
+        chat_window = None
+        legacy_chat_window = None
+        def open_chat(self):
+            self.modern_chat_window = win
+    class FakeShell:
+        instance = FakeInst()
+    got = a._ensure_chat(FakeShell(), silent=False)
+    assert got is win
+
+
+def test_ensure_chat_silent_falls_back_when_modern_signature_rejects_silent():
+    # 旧版 open_modern_chat 不接受 silent 关键字 → 捕获 TypeError 后无参重试。
+    a = _make()
+    class FakeWin:
+        def voice_submit(self, t): pass
+    win = FakeWin()
+    class FakeInst:
+        modern_chat_window = None
+        chat_window = None
+        legacy_chat_window = None
+        def open_modern_chat(self):  # 无 silent 参数
+            self.modern_chat_window = win
+    class FakeShell:
+        instance = FakeInst()
+    got = a._ensure_chat(FakeShell())
+    assert got is win
+
+
+
+def test_usable_device_cached_skips_probe_in_pick():
+    # 已缓存可用端点时，_pick_device 直接用缓存（用探针计数验证不会重复试录全部端点）。
+    a = _make()
+    calls = []
+    def fake_probe(dev, seconds=0.2):
+        calls.append(dev)
+        return (True, 0.05, 0.4, 44100)
+    a._probe_input_stream = fake_probe  # type: ignore[assignment]
+    a._usable_device = 2
+    got = a._pick_device()
+    assert got == 2
+    assert calls and calls[0] == 2  # 首选命中缓存，不再遍历其它端点
+
+
+def test_warmup_device_is_noop_when_cached():
+    a = _make()
+    a._usable_device = 5
+    a._warmup_device()  # 已缓存 -> 不应起线程/抛错
+    assert a._usable_device == 5
+
+def test_on_released_hides_bubble_even_when_not_recording():
+    # 连按场景：松手时即便状态不是 recording，也必须把「正在听你说话」气泡收起。
+    a = _make()
+    hidden = []
+    ended = []
+    a._hide_listen_bubble = lambda: hidden.append(1)
+    a._end_recording = lambda: ended.append(1)
+    a._state = "processing"
+    a._on_released_gui()
+    assert hidden == [1]
+    assert ended == [1]

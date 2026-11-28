@@ -991,11 +991,11 @@ class PetInstance:
         window = self.legacy_chat_window
         self._present_dialog(window, lambda: window.position_near_pet(host))
 
-    def open_modern_chat(self) -> None:
+    def open_modern_chat(self, silent: bool = False) -> None:
         host = self._chat_host()
         if not self.enable_chat or host is None:
             return
-        if self._defer_while_popup_active("modern-chat", self.open_modern_chat):
+        if not silent and self._defer_while_popup_active("modern-chat", self.open_modern_chat):
             return
         from .chat.widgets import ChatWindow
         if not self._chat_window_usable(self.modern_chat_window):
@@ -1011,6 +1011,10 @@ class PetInstance:
             self.modern_chat_window.set_pet_window(host)
         self.chat_window = self.modern_chat_window
         window = self.modern_chat_window
+        if silent:
+            # 语音注入用：只建窗/复用窗，不 show/raise/activate，不在前台弹出。
+            # 生成由 _begin_generation 驱动，与窗口可见性无关。
+            return
         self._present_dialog(window, lambda: window.position_near_pet(host))
 
     @staticmethod
