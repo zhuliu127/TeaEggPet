@@ -245,6 +245,42 @@ _engine_lock = threading.Lock()
 _cuda_available: "bool | None" = None
 
 
+def _stub_nagisa_if_needed() -> None:
+    """在我们只做「转文字」时，绕开 nagisa 这个沉重的可选依赖。
+
+    为什么需要：``import qwen_asr`` 会连带 import ``Qwen3ForcedAligner``（时间戳对齐器），
+    后者顶层 ``import nagisa``；而 nagisa 在 import 时就会用 DyNet 加载一个 39MB 的模型文件
+    ``nagisa_v001.model``。DyNet 的 C++ 读取用的是**窄字符 fopen**，在**中文路径**
+    （如 ``D:\\自研软件\\桌宠\\TeaEggPet``）下会直接读不出来 →
+    ``RuntimeError: Could not read model from ...\\nagisa_v001.model`` →
+    整个 ``import qwen_asr`` 崩掉 → 语音识别模型加载失败 → 说完话没反应。
+
+    我们**从不使用对齐器**（只用 ``Qwen3ASRModel.transcribe`` 出文字），而 nagisa 也
+    只在对齐器实际运行的那一行（``qwen3_forced_aligner.py:102``）才会被调用。所以这里
+    在 import qwen_asr 之前，先把 ``nagisa`` 用一个空壳模块顶进 ``sys.modules``：
+    import 能顺利通过，且永远走不到那段真正需要 nagisa 的代码。
+
+    即便 nagisa 真能被加载，这一步也无害（省下一份 39MB 模型常驻）。只有真的要用对齐器
+    的场景才会受影响——而本程序没有这种场景。
+    """
+    import sys as _sys
+    import types as _types
+
+    if "nagisa" in _sys.modules:
+        return
+    stub = _types.ModuleType("nagisa")
+
+    class _Tagging:  # 极简占位：万一被误调用也能返回空词表，不至于崩
+        words: list = []
+
+    def _tagging(_text):  # noqa: ANN001
+        return _Tagging()
+
+    stub.tagging = _tagging  # type: ignore[attr-defined]
+    stub.Tagger = object  # type: ignore[attr-defined]
+    _sys.modules["nagisa"] = stub
+
+
 def _torch():
     import torch  # type: ignore
     return torch
@@ -269,6 +305,7 @@ def load_engine(model_path: str, *, device: str = "cpu", compute_type: str = "in
                 _engine_cache[key] = _v
                 return _v
 
+        _stub_nagisa_if_needed()
         from qwen_asr import Qwen3ASRModel  # type: ignore
 
         def _make(dev: str):
