@@ -10,7 +10,8 @@
    （``released`` 信号）。
 4. 文字非空 → 当作打字一样发进 AI 对话：程序自动调用 LLM 生成回复，
    并用本地 TTS 把回复念出来（复用既有聊天窗的朗读通道），同时在桌宠冒气泡。
-5. 语音里的「自拍 / 溜达 / 回家」类指令也照常识别（说「自拍」先二次确认）。
+5. 语音里的「自拍 / 溜达 / 回家」类指令也照常识别（说「自拍」直接拍，不再二次确认——
+   持续监听已去掉，收不到「确认」，故指令命中即执行）。
 
 设计要点
 --------
@@ -943,9 +944,11 @@ class VoiceAssistant(QObject):
         if self._state == "confirm":
             self._handle_confirm(text)
             return
-        # 自拍指令先二次确认
+        # 自拍指令：直接拍（持续监听已去掉，收不到「确认」二次确认，故不再追问）
         if _contains_any(text, SELFIE_WORDS):
-            self._ask_selfie()
+            self._say("好嘞，先拍一张～")
+            self._do_selfie()
+            self._set_state("idle")
             return
         if _contains_any(text, HOME_WORDS):
             self._do_home()

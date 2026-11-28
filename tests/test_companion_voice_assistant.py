@@ -112,14 +112,15 @@ def test_end_recording_when_not_recording_noop():
 
 
 # ---------------------------------------------------------------- 识别后分派
-def test_dispatch_selfie_goes_to_confirm(monkeypatch):
+def test_dispatch_selfie_takes_directly(monkeypatch):
+    # v1.4.40：持续监听已去掉，说「自拍」直接拍，不再二次确认。
     a = _make({"companion_voice_enabled": True})
     called = []
     a._do_selfie = lambda: called.append("selfie")  # type: ignore[assignment]
     a._state = "idle"
     a._dispatch("帮我自拍一张吧")
-    assert a.state == "confirm"
-    assert called == []  # 还要二次确认
+    assert a.state == "idle"
+    assert called == ["selfie"]  # 直接拍，无二次确认
 
 
 def test_dispatch_home_prioritized_over_walk():
