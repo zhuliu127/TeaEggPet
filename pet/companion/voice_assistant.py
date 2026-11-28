@@ -69,6 +69,8 @@ _HALLUCINATION_PHRASES = (
     "谢谢观看", "感谢观看", "请订阅", "订阅", "点赞", "字幕", "出品", "独家",
     "禁止转载", "未经允许", "网易云音乐", "qq音乐", "伴奏", "纯音乐",
     "bilibili", "哔哩哔哩", "字幕由", "明镜与点点", "未经许可",
+    "索兰娅", "zither", "harper", "harps", "subtitle", "subtitles",
+    "amara", "音译", "校对", "自动生成", "製作人", "制作人",
 )
 
 
@@ -299,6 +301,8 @@ class VoiceAssistant(QObject):
         self._rec_stream = None
         self._rec_chunks: list = []
         self._rec_dev_index: int | None = None
+        # 上次识别成功时的设备索引：下次优先用它（避开死端点）。None=还没确定。
+        self._last_good_device: int | None = None
         # 静音窗口：她自己说话时段的回声要挡掉（仅本地 TTS 我们自己设的窗口）。
         self._mute_until = 0.0
         try:
@@ -469,11 +473,15 @@ class VoiceAssistant(QObject):
         threading.Thread(target=self._transcribe_and_dispatch, args=(chunks,),
                          name="VoiceTranscribe", daemon=True).start()
 
-    def _pick_device(self) -> int | None:
-        """按配置的麦克风名挑一个能用的输入设备（WASAPI 优先，MME 靠后）。"""
+    def _device_candidates(self) -> list:
+        """按配置的麦克风名返回【全部可用输入端点】，按优先级排序。
+
+        排序依据（实测本机 BOYA）：WASAPI / DirectSound 这两路能收到真实人声，
+        而 MME / WDM-KS 常常是「能开但永远静音」的死端点。所以把 WASAPI、
+        DirectSound 排在前面，MME / WDM-KS 垫底；同名内声道多的优先。
+        返回元素为 sounddevice 的设备索引（int）。名字为空或没匹配到 → [None]（系统默认）。
+        """
         name = str(self._cfg("companion_voice_device", "") or "").strip()
-        if not name:
-            return None
         try:
             import sounddevice as sd
 
@@ -483,19 +491,54 @@ class VoiceAssistant(QObject):
                 hostapis = []
             hits = []
             for idx, dev in enumerate(sd.query_devices()):
-                if int(dev.get("max_input_channels", 0)) > 0 and name in str(dev.get("name", "")):
-                    try:
-                        api = str(hostapis[dev.get("hostapi", -1)].get("name", ""))
-                    except Exception:  # noqa: BLE001
-                        api = ""
-                    hits.append((idx, api))
+                ch = int(dev.get("max_input_channels", 0))
+                if ch <= 0:
+                    continue
+                if name and name not in str(dev.get("name", "")):
+                    continue
+                try:
+                    api = str(hostapis[dev.get("hostapi", -1)].get("name", "")).upper()
+                except Exception:  # noqa: BLE001
+                    api = ""
+                # 等级：WASAPI=3, DirectSound=3, 其它(MME/WDM-KS)=0
+                if "WASAPI" in api:
+                    tier = 3
+                elif "DIRECTSOUND" in api:
+                    tier = 3
+                else:
+                    tier = 0
+                hits.append((tier, ch, idx))
             if not hits:
-                return None
-            hits.sort(key=lambda t: (1 if "WASAPI" in t[1].upper() else 0,
-                                     0 if "MME" in t[1].upper() else 1), reverse=True)
-            return hits[0][0]
+                return [None]
+            hits.sort(key=lambda t: (t[0], t[1]), reverse=True)
+            # 把上次实测音量最好的设备提到最前（_last_good_device）
+            cands = [t[2] for t in hits]
+            lg = getattr(self, "_last_good_device", None)
+            if lg is not None and lg in cands:
+                cands.remove(lg)
+                cands.insert(0, lg)
+            return cands
         except Exception:  # noqa: BLE001
-            return None
+            return [None]
+
+    def _pick_device(self) -> int | None:
+        """挑首选输入设备（候选第一个）。"""
+        cands = self._device_candidates()
+        return cands[0] if cands else None
+
+    def _demote_device(self, bad_dev) -> None:
+        """把没听清的端点降级：下次首选换成候选里的下一个（避开死端点/低灵敏端点）。"""
+        try:
+            cands = self._device_candidates()
+            if not cands:
+                return
+            if bad_dev in cands and len(cands) > 1:
+                idx = cands.index(bad_dev)
+                nxt = cands[(idx + 1) % len(cands)]
+                self._last_good_device = nxt
+                log.info("麦克风端点 %s 未识别成功，下次改用端点 %s", bad_dev, nxt)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _transcribe_and_dispatch(self, chunks) -> None:
         """后台线程：把录音拼起来 → 重采样到 16k → Whisper 识别 → 派发。"""
@@ -554,14 +597,19 @@ class VoiceAssistant(QObject):
             self.heard.emit(text or "")
             text = (text or "").strip()
             log.info("识别结果：%r", text)
-            if not text:
+            used_dev = self._rec_dev_index
+            if not text or _looks_like_subtitle_junk(text) or _looks_hallucinated(text):
+                # 这个端点没听清 / 出字幕套话幻听：把它降级，下次按住说话换下一个候选端点
+                self._demote_device(used_dev)
                 self._set_state("idle")
-                self.status.emit("（没听清）再按住「%s」说一遍～" % self.hotkey_combo())
+                if not text:
+                    self.status.emit("（没听清）再按住「%s」说一遍～" % self.hotkey_combo())
+                else:
+                    self.status.emit("（这段没听清，换了个麦克风，再说一次试试）")
                 return
-            if _looks_like_subtitle_junk(text) or _looks_hallucinated(text):
-                self._set_state("idle")
-                self.status.emit("（这段没听清，忽略了）")
-                return
+            # 识别成功 → 记住这个端点，下次优先用它
+            if used_dev is not None:
+                self._last_good_device = used_dev
             self._last_user_text = text
             QTimer.singleShot(0, lambda: self._dispatch(text))
         except Exception as exc:  # noqa: BLE001
@@ -605,7 +653,14 @@ class VoiceAssistant(QObject):
             compute = str(self._cfg("companion_whisper_compute", "int8") or "int8")
             self._engine = asr.load_engine(model_dir, device=device, compute_type=compute)
             self._model_main_info = str(model_dir)
-            log.info("语音识别模型已加载：%s（device=%s,%s）", model_dir, device, compute)
+            try:
+                eff_cuda = bool(getattr(asr, "_cuda_available", None))
+            except Exception:
+                eff_cuda = False
+            eff_note = "cuda" if eff_cuda else ("cpu（CUDA 不可用已自动回退，不影响使用）"
+                                               if device != "cpu" else "cpu")
+            log.info("语音识别模型已加载：%s（请求 device=%s,%s 实际=%s）",
+                     model_dir, device, compute, eff_note)
             return True
         except Exception as exc:  # noqa: BLE001
             log.exception("加载 Whisper 模型失败")

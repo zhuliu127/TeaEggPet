@@ -285,3 +285,65 @@ def test_voiced_ratio_speech_like_vs_flat():
     burst = np.concatenate([rng.standard_normal(8000).astype(np.float32) * 0.05,
                             np.zeros(8000, dtype=np.float32)])
     assert va._voiced_ratio(speechlike) >= va._voiced_ratio(burst)
+
+
+def test_subtitle_junk_filters_new_phrases():
+    # v1.4.25：实测会出现「字幕by索兰娅」「字幕製作人Zither Harp」这类幻听，必须过滤
+    assert va._looks_like_subtitle_junk("字幕by索兰娅") is True
+    assert va._looks_like_subtitle_junk("字幕製作人Zither Harp") is True
+    assert va._looks_like_subtitle_junk("今天天气真不错我们出去玩") is False
+
+
+def test_device_candidates_orders_wasapi_directsound_first():
+    # _device_candidates 应把 WASAPI / DirectSound 排在 MME / WDM-KS 之前
+    import sys
+    fake_sd = types.SimpleNamespace(
+        query_hostapis=lambda: [{"name": "Windows MME"},
+                                {"name": "Windows DirectSound"},
+                                {"name": "Windows WASAPI"},
+                                {"name": "Windows WDM-KS"}],
+        query_devices=lambda: [
+            {"name": "麦克风 (BOYA)", "max_input_channels": 1, "hostapi": 0},   # MME 0
+            {"name": "麦克风 (BOYA)", "max_input_channels": 1, "hostapi": 1},   # DS 1
+            {"name": "麦克风 (BOYA)", "max_input_channels": 2, "hostapi": 2},   # WASAPI 2
+            {"name": "麦克风 (BOYA)", "max_input_channels": 1, "hostapi": 3},   # WDM-KS 3
+        ],
+    )
+    orig = sys.modules.get("sounddevice")
+    sys.modules["sounddevice"] = fake_sd
+    try:
+        a = _make({"companion_voice_device": "BOYA"})
+        a._last_good_device = None
+        cands = a._device_candidates()
+    finally:
+        if orig is not None:
+            sys.modules["sounddevice"] = orig
+        else:
+            sys.modules.pop("sounddevice", None)
+    # WASAPI(2)、DirectSound(1) 应排在 MME(0)、WDM-KS(3) 前
+    assert cands.index(2) < cands.index(0)
+    assert cands.index(1) < cands.index(0)
+
+
+def test_demote_device_moves_to_next_candidate():
+    import sys
+    fake_sd = types.SimpleNamespace(
+        query_hostapis=lambda: [{"name": "Windows MME"}, {"name": "Windows WASAPI"}],
+        query_devices=lambda: [
+            {"name": "BOYA", "max_input_channels": 1, "hostapi": 0},  # MME 0
+            {"name": "BOYA", "max_input_channels": 2, "hostapi": 1},  # WASAPI 1
+        ],
+    )
+    orig = sys.modules.get("sounddevice")
+    sys.modules["sounddevice"] = fake_sd
+    try:
+        a = _make({"companion_voice_device": "BOYA"})
+        a._last_good_device = None
+        # 首选是 WASAPI(1)，把它降级后应改用下一个候选 MME(0)
+        a._demote_device(1)
+        assert a._last_good_device == 0
+    finally:
+        if orig is not None:
+            sys.modules["sounddevice"] = orig
+        else:
+            sys.modules.pop("sounddevice", None)
