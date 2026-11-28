@@ -15,7 +15,7 @@ from __future__ import annotations
 from . import __version__ as KERNEL_VERSION
 
 PRODUCT_NAME = 'TeaEggPet'
-PRODUCT_VERSION = '1.4.22'
+PRODUCT_VERSION = '1.4.23'
 
 
 

@@ -1,6 +1,6 @@
 {
-  "version": "1.4.22",
-  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases/tag/v1.4.22",
-  "notes": "语音对话改成「按住说话」：删掉了唤醒词/结束词的常驻监听（之前它总把麦克风信号吃掉，唤醒后说什么都没反应）。现在按住语音键（默认 Win+Alt，可在设置里改）开始听，松开后自动用本地 Whisper 识别成文字发给 AI，AI 回复再用语音念出来。设置页也删掉了唤醒/结束词和唤醒模型，只保留一套「语音识别模型」并显示当前实际在用的模型。",
+  "version": "1.4.23",
+  "html_url": "https://github.com/zhuliu127/TeaEggPet/releases/tag/v1.4.23",
+  "notes": "修复 v1.4.22 的一个回归：设置页「测试麦克风」按钮报 module has no attribute probe_mic（改推挽式时漏把麦克风测试探针加回去）。现已补回 probe_mic / list_input_devices，点「测试麦克风」会录制 3 秒、显示实时电平条并给出是否正常收音的结论；同名多端点会自动挑 WASAPI 那个能收听的。",
   "assets": {}
 }

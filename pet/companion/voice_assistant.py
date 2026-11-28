@@ -129,6 +129,148 @@ def _voiced_ratio(x, frame: int = 480) -> float:
     return float(np.mean(energies > peak * 0.25))
 
 
+def _resample_to_16k(x, src_sr: int):
+    """把任意采样率的单声道 float32 数组线性插值到 16kHz。"""
+    import numpy as np
+
+    a = np.asarray(x, dtype=np.float32).reshape(-1)
+    if src_sr == SAMPLE_RATE or a.shape[0] == 0:
+        return a
+    need = int(round(a.shape[0] * SAMPLE_RATE / src_sr))
+    if need <= 0:
+        return np.zeros(0, dtype=np.float32)
+    src = np.linspace(0.0, 1.0, a.shape[0], endpoint=False, dtype=np.float32)
+    dst = np.linspace(0.0, 1.0, need, endpoint=False, dtype=np.float32)
+    return np.interp(dst, src, a).astype(np.float32)
+
+
+def list_input_devices() -> list:
+    """返回所有输入设备 [(序号, 名称, 声道数), ...]（供设置页/测试用）。"""
+    try:
+        import sounddevice as sd
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    try:
+        for idx, dev in enumerate(sd.query_devices()):
+            ch = int(dev.get("max_input_channels", 0))
+            if ch > 0:
+                out.append((idx, str(dev.get("name", "")), ch))
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+def probe_mic(device_name: str = "", seconds: float = 3.0, on_level=None) -> dict:
+    """测麦克风能否正常收音：录 seconds 秒，边录边回调 on_level(rms)，返回统计。
+
+    同名设备（Windows 常把同一支麦在 MME/DirectSound/WASAPI/WDM-KS 各登记一份）
+    按「WASAPI 优先、MME 靠后、声道多优先」排序，逐个用**设备原生采样率**开流试录，
+    取平均电平最大的那个。返回 {ok, rms, peak, sr, device, error}。
+    """
+    import numpy as np
+
+    result = {"ok": False, "rms": 0.0, "peak": 0.0, "sr": 0, "device": None, "error": ""}
+    try:
+        import sounddevice as sd
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = f"没有 sounddevice：{exc}"
+        return result
+    try:
+        hostapis = sd.query_hostapis()
+    except Exception:  # noqa: BLE001
+        hostapis = []
+    devices = sd.query_devices()
+
+    # 收集候选：同名输入设备按 WASAPI 优先/MME 靠后排序
+    name = (device_name or "").strip()
+    cands = []
+    for idx, dev in enumerate(devices):
+        ch = int(dev.get("max_input_channels", 0))
+        if ch <= 0:
+            continue
+        if name and name not in str(dev.get("name", "")):
+            continue
+        try:
+            api = str(hostapis[dev.get("hostapi", -1)].get("name", ""))
+        except Exception:  # noqa: BLE001
+            api = ""
+        cands.append((idx, api, ch))
+    if not cands:
+        # 没指定名字或没匹配到 → 用系统默认输入设备
+        try:
+            dflt = sd.query_devices(kind="input")
+            cands = [(None, "", int(dflt.get("max_input_channels", 1)))]
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = f"找不到可用输入设备：{exc}"
+            return result
+    cands.sort(key=lambda t: (1 if "WASAPI" in t[1].upper() else 0,
+                              0 if "MME" in t[1].upper() else 1,
+                              t[2]), reverse=True)
+
+    best = None  # (mean_rms, peak, sr, idx)
+    last_err = ""
+    for idx, _api, _ch in cands:
+        try:
+            info = sd.query_devices(idx) if idx is not None else sd.query_devices(kind="input")
+            sr = int(info.get("default_samplerate") or 44100)
+            block = max(1, int(sr * 0.03))
+            frames = int(seconds * sr)
+            stream = sd.InputStream(samplerate=sr, channels=1, dtype="float32",
+                                    blocksize=block, device=idx)
+            stream.start()
+            collected = []
+            left = frames
+            try:
+                while left > 0:
+                    data, _of = stream.read(min(block, left))
+                    raw = data[:, 0] if data.ndim > 1 else data
+                    chunk = np.asarray(raw, dtype=np.float32).copy()
+                    collected.append(chunk)
+                    left -= chunk.shape[0]
+                    if chunk.size:
+                        r = float(np.sqrt(np.mean(chunk ** 2)) + 1e-12)
+                        if on_level is not None:
+                            try:
+                                on_level(r)
+                            except Exception:  # noqa: BLE001
+                                pass
+            finally:
+                try:
+                    stream.stop(); stream.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            audio = np.concatenate(collected) if collected else np.zeros(0, dtype=np.float32)
+            if audio.size == 0:
+                last_err = "没读到音频数据"
+                continue
+            mean_rms = float(np.sqrt(np.mean(audio ** 2)) + 1e-12)
+            peak = float(np.max(np.abs(audio)))
+            if best is None or mean_rms > best[0]:
+                best = (mean_rms, peak, sr, idx)
+            # 已经足够响，不用再试别的端点
+            if mean_rms > 0.01:
+                break
+        except Exception as exc:  # noqa: BLE001
+            last_err = str(exc)
+            continue
+
+    if best is None:
+        result["error"] = last_err or "所有麦克风端点都打不开"
+        return result
+    mean_rms, peak, sr, idx = best
+    result.update({
+        "rms": mean_rms,
+        "peak": peak,
+        "sr": sr,
+        "device": idx,
+        "ok": bool(mean_rms > 0.001 or peak > 0.02),
+    })
+    if not result["ok"]:
+        result["error"] = "麦克风几乎没电平（可能静音/选错设备/硬件没在收音）"
+    return result
+
+
 class VoiceAssistantError(RuntimeError):
     pass
 
