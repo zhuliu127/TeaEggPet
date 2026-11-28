@@ -52,6 +52,10 @@ MAX_RECORD_SEC = 30.0
 # 简体中文引导 prompt：faster-whisper 的中文模型训练数据偏繁体，不加引导常输出繁体
 # （用户看到「電池的社會」「終於成功了」即为繁体误识），引导后能稳定输出简体。
 ZH_SIMPLIFIED_PROMPT = "以下是普通话的句子，请用简体中文输出。"
+# 留给 whisper 的极简引导：v1.4.34 起改用「省略号 + 中文」这么一句无实义词，避免
+# 模型把「请用简体中文输出」这类指令性短语当成正文复述出来。识别主路径第一遍
+# 甚至不传 prompt（见 asr.transcribe），因此这里的长度对回声影响已很小。
+ZH_INITIAL_PROMPT = "中文语音转写。"
 
 # 高通滤波截止频率：去掉 80Hz 以下的低频嗡声/电流声（空调、风扇、桌面共振多在 60Hz 附近），
 # 能明显提升低信噪比录音的可懂度，还顺带减少繁体输出。
@@ -117,10 +121,47 @@ _HALLUCINATION_PHRASES = (
     "bilibili", "哔哩哔哩", "字幕由", "明镜与点点", "未经许可",
     "索兰娅", "zither", "harper", "harps", "subtitle", "subtitles",
     "amara", "音译", "校对", "自动生成", "製作人", "制作人",
-    # v1.4.33：initial_prompt 在静音/低信噪比段会被 whisper 复述出来，必须过滤，
-    # 否则「请用简体中文输出。」会被当成用户说的话送进 AI 对话。
+    # v1.4.33/34：initial_prompt 在静音/低信噪比段会被 whisper 复述出来，必须过滤，
+    # 否则「请用简体中文输出。」「整体中文输出。」等会被当成用户说的话送进 AI 对话。
     "请用简体", "简体中文", "以下是普通话", "普通话的句子", "用简体",
+    "整体中文", "简体输出", "中文输出", "整体输出",
 )
+
+
+def _to_simplified(text: str) -> str:
+    """繁体 → 简体转换（中文 whisper 模型常输出繁体，观感像「识别不对」）。
+
+    优先用 zhconv（纯 Python，无需额外二进制）；缺失时退回内置常用繁简映射兜底。
+    只做字符级转换，不改动标点/英文/数字。
+    """
+    s = text or ""
+    if not s:
+        return s
+    try:
+        import zhconv  # type: ignore
+        return zhconv.convert(s, "zh-cn")
+    except Exception:  # noqa: BLE001
+        pass
+    # 兜底：内置高频繁→简字表（覆盖识别里最常蹦出来的那些字，够用）
+    table = str.maketrans(_T2S_FALLBACK)
+    return s.translate(table)
+
+
+# 高频繁体字 → 简体兜底映射（zhconv 缺失时使用，覆盖常见口语/问句用字）
+_T2S_FALLBACK = {
+    "這": "这", "樣": "样", "麼": "么", "麼": "么", "嗎": "吗", "呢": "呢",
+    "魚": "鱼", "天": "天", "氣": "气", "怎": "怎", "幫": "帮", "訂": "订",
+    "個": "个", "點": "点", "鬧": "闹", "鐘": "钟", "裝": "装", "鍋": "锅",
+    "說": "说", "話": "话", "對": "对", "錯": "错", "沒": "没", "開": "开",
+    "關": "关", "們": "们", "來": "来", "過": "过", "還": "还", "會": "会",
+    "覺": "觉", "後": "后", "裡": "里", "邊": "边", "給": "给", "時": "时",
+    "現": "现", "在": "在", "為": "为", "從": "从", "聽": "听", "聲": "声",
+    "買": "买", "賣": "卖", "東": "东", "車": "车", "飯": "饭", "讓": "让",
+    "請": "请", "誰": "谁", "問": "问", "題": "题", "準": "准", "備": "备",
+    "歡": "欢", "愛": "爱", "興": "兴", "應": "应", "該": "该", "國": "国",
+    "學": "学", "習": "习", "師": "师", "節": "节", "熱": "热", "樂": "乐",
+    "條": "条", "幾": "几", "張": "张", "場": "场", "長": "长", "間": "间",
+}
 
 
 def _looks_like_subtitle_junk(text: str) -> bool:
@@ -134,15 +175,18 @@ def _looks_like_subtitle_junk(text: str) -> bool:
 
 
 def _is_prompt_echo(text: str) -> bool:
-    """检测 whisper 把 initial_prompt 复述出来的情况（静音/低信噪比时常发生）。
+    """检测 whisper 把 initial_prompt 复述/绕说出来的情况（静音/低信噪比时常发生）。
 
-    只要识别结果里出现提示词的显著片段（如「请用简体」「以下是普通话」「用简体中文输出」），
-    就认为它是提示词回声、不是用户真的说的话，必须丢弃。
+    除了完整片段，还要覆盖被「听歪」的近音变体（如「整体中文输出」「请用车车服用」
+    「简体输出」），因为 whisper 复述提示词时往往会把字听错、但仍保留词形。
+    注意：v1.4.34 起识别主路径已不传 initial_prompt，此项作为兜底防护仍保留。
     """
     t = _norm(text)
     if not t:
         return False
-    for frag in ("请用简体", "简体中文输出", "以下是普通话", "普通话的句子", "用简体中文", "简体中文"):
+    for frag in ("请用简体", "简体中文输出", "以下是普通话", "普通话的句子",
+                 "用简体中文", "简体中文", "整体中文", "简体输出", "中文输出",
+                 "整体输出"):
         if _norm(frag) in t:
             return True
     return False
@@ -592,6 +636,11 @@ class VoiceAssistant(QObject):
             dev = getattr(self, "_usable_device", None)
             if dev is None:
                 dev = self._pick_device()
+            if dev is None:
+                # 连默认设备都不可用：明确报错，别静默无反应。
+                log.warning("按住说话时没有可用的麦克风端点")
+                self.error.emit("没找到可用的麦克风，请到设置里选对麦克风或点「测试麦克风」")
+                return
             dvinfo = sd.query_devices(dev) if dev is not None else sd.query_devices(kind="input")
             sr = int(dvinfo.get("default_samplerate") or SAMPLE_RATE)
             block = max(1, int(sr * BLOCK_MS / 1000))
@@ -603,11 +652,24 @@ class VoiceAssistant(QObject):
             log.info("开始录音：device=%s samplerate=%d", dev, sr)
             max_blocks = int(MAX_RECORD_SEC * sr / block)
             n = 0
+            # v1.4.34：每次只读一小片（≤20ms），松开后最多 20ms 就退出循环，
+            # 避免一次 stream.read 阻塞 30ms 导致「松手后还有个延迟才停」。
+            sub = max(1, int(sr * 0.02))
+            all_zero_blocks = 0
             while not self._rec_stop.is_set() and n < max_blocks:
-                data, _of = stream.read(block)
+                data, _of = stream.read(sub)
                 raw = data[:, 0].copy() if data.ndim > 1 else data.copy()
                 self._rec_chunks.append((raw.astype(np.float32), sr))
                 n += 1
+                # v1.4.34：连续录到全零（说明这个端点其实是死的，如 DirectSound 返回全零），
+                # 计数以便事后降级端点，避免每次都白录一整段。
+                if float(np.max(np.abs(raw))) < 1e-6:
+                    all_zero_blocks += 1
+                else:
+                    all_zero_blocks = 0
+            if all_zero_blocks >= n and n > 5:
+                log.warning("端点 %s 整段录音全为零（疑似死端点），下次换端点", dev)
+                self._demote_device(dev)
         except Exception as exc:  # noqa: BLE001
             log.exception("录音失败")
             self.error.emit(f"录音失败：{exc}")
@@ -632,7 +694,10 @@ class VoiceAssistant(QObject):
         self.status.emit("正在识别…")
         th = self._rec_thread
         if th is not None:
-            th.join(timeout=3.0)  # 录音线程会很快退出（最多一个 block 的等待）
+            # v1.4.34：录音循环每片≤20ms，松手后应当很快退出；join 上限收紧到 0.6s。
+            # 若 0.6s 还没退出（极少见，如设备卡顿），不强等——直接取已录到的音频去识别，
+            # 同时让后台线程自己在下一次 read 返回后清理（避免拖住 UI 造成「松手延迟」）。
+            th.join(timeout=0.6)
         chunks = list(self._rec_chunks)
         self._rec_chunks = []
         if not chunks:
@@ -805,7 +870,9 @@ class VoiceAssistant(QObject):
             log.info("录音结束：时长 %.2fs rms=%.4f", audio.shape[0] / SAMPLE_RATE, rms)
 
             # 电平太低基本是没说话/麦克风静音——直接提示，别硬塞给 Whisper 产生幻听。
-            if rms < 0.004:
+            # v1.4.34：门槛从 0.004 降到 0.003（BOYA 实测正常说话 rms 0.05~0.26，太小的
+            # 阈值只会误杀轻声细语；低于 0.003 基本确实是没声音）。
+            if rms < 0.003:
                 self._set_state("idle")
                 self.status.emit(
                     "（没收到声音）麦克风电平太低，请确认没静音、选对麦克风，"
@@ -834,10 +901,14 @@ class VoiceAssistant(QObject):
 
             beam = max(1, int(self._cfg("companion_whisper_beam", 2) or 2))
             # vad_filter=False：录音已经很短、且已按需门控，Whisper 内部 VAD 常把短的整句判成静音返回空。
-            # initial_prompt 引导简体（否则中文模型常输出繁体，观感像「识别错」）。
+            # v1.4.34：第一遍不传 initial_prompt（最不易触发「请用简体中文输出」式回声）；
+            # 若一段有声但没出文本，asr.transcribe 内部再用极简 prompt 兜底。
             text = asr.transcribe(self._engine, audio, language="zh",
                                   vad_filter=False, beam_size=beam,
-                                  initial_prompt=ZH_SIMPLIFIED_PROMPT)
+                                  initial_prompt=None)
+            # v1.4.34：不再靠 initial_prompt 逼简体（易被 whisper 复述成「请用简体中文输出」），
+            # 改为识别后做繁→简转换。中文 whisper 模型常输出繁体，转成简体后观感才对。
+            text = _to_simplified(text or "")
             self.heard.emit(text or "")
             text = (text or "").strip()
             log.info("识别结果：%r", text)

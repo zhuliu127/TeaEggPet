@@ -315,10 +315,23 @@ def test_is_prompt_echo_detects_initial_prompt_leak():
     assert va._is_prompt_echo("以下是普通话的句子，请用简体中文输出。") is True
     assert va._is_prompt_echo("用简体中文输出") is True
     assert va._is_prompt_echo("简体中文") is True
+    # v1.4.34：用户实测的「听歪」变体也要拦
+    assert va._is_prompt_echo("整体中文输出。") is True
+    assert va._is_prompt_echo("简体输出") is True
     # 正常用户话不应被误判
     assert va._is_prompt_echo("今天天气怎么样") is False
     assert va._is_prompt_echo("帮我订个闹钟") is False
     assert va._is_prompt_echo("") is False
+
+
+def test_to_simplified_converts_traditional():
+    # v1.4.34：不再用 initial_prompt 逼简体（易回声），改为识别后繁→简转换。
+    assert va._to_simplified("小魚小魚今天天氣怎麼樣") == "小鱼小鱼今天天气怎么样"
+    assert va._to_simplified("幫我訂一個明天早上八點的鬧鐘") == "帮我订一个明天早上八点的闹钟"
+    assert va._to_simplified("我想吃火鍋了") == "我想吃火锅了"
+    # 已是简体 / 英文数字 保持不变
+    assert va._to_simplified("你好abc123") == "你好abc123"
+    assert va._to_simplified("") == ""
 
 
 def test_subtitle_junk_filters_prompt_echo_phrases():
